@@ -6,8 +6,16 @@ members = [
   "iroh",
   "iroh/bench",
   "iroh-relay",
+  "M2_P2P_DB",
 ]
 resolver = "2"
+
+# M2_P2P_DB depends on third-party crates that depend on the published
+# `iroh`; patch them all onto this checkout so there is exactly one `iroh`
+# (and one `iroh-base`) in the graph.
+[patch.crates-io]
+iroh = { path = "iroh" }
+iroh-base = { path = "iroh-base" }
 
 [profile.release]
 debug = true

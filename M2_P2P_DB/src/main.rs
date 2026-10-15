@@ -6,9 +6,11 @@
 //! {
 //!   "record_id": "UUID",
 //!   "updated_at": "2026-10-14T15:00:00+08:00",
-//!   "username": "OA",
+//!   "ghname": "oahsiao",
+//!   "loginname": "v-oahsiao",
 //!   "cp_aic": 87226,
 //!   "device_id": "Iroh Node ID",
+//!   "device_name": "xx",
 //!   "info1": "xx",
 //!   "info2": "xx"
 //! }
@@ -23,7 +25,7 @@
 //!
 //!     M2_P2P_DB listen
 //!     M2_P2P_DB connect <endpoint-id>
-//!     M2_P2P_DB create --username OA --cp-aic 87226 --info1 xx --info2 xx
+//!     M2_P2P_DB create --ghname oahsiao --loginname v-oahsiao --cp-aic 87226 --info1 xx --info2 xx
 //!     M2_P2P_DB read <record-id>
 //!     M2_P2P_DB update <record-id> --cp-aic 90000
 //!     M2_P2P_DB delete <record-id>
@@ -93,8 +95,12 @@ enum Command {
     },
     /// Create a new record (record_id is a fresh UUID).
     Create {
+        /// GitHub-style display name.
         #[arg(long)]
-        username: String,
+        ghname: String,
+        /// Login/account name.
+        #[arg(long)]
+        loginname: String,
         #[arg(long)]
         cp_aic: f64,
         #[arg(long, default_value = "")]
@@ -104,6 +110,9 @@ enum Command {
         /// Endpoint ID to stamp as device_id (defaults to "local" unless given).
         #[arg(long)]
         device_id: Option<String>,
+        /// Human-readable device name.
+        #[arg(long, default_value = "")]
+        device_name: String,
     },
     /// Read a record by UUID.
     Read { record_id: Uuid },
@@ -111,13 +120,17 @@ enum Command {
     Update {
         record_id: Uuid,
         #[arg(long)]
-        username: Option<String>,
+        ghname: Option<String>,
+        #[arg(long)]
+        loginname: Option<String>,
         #[arg(long)]
         cp_aic: Option<f64>,
         #[arg(long)]
         info1: Option<String>,
         #[arg(long)]
         info2: Option<String>,
+        #[arg(long)]
+        device_name: Option<String>,
     },
     /// Delete a record.
     Delete { record_id: Uuid },
@@ -144,12 +157,12 @@ async fn main() -> Result<()> {
             println!("sync with {endpoint_id} complete");
             Ok(())
         }
-        Command::Create { username, cp_aic, info1, info2, device_id } => {
+        Command::Create { ghname, loginname, cp_aic, info1, info2, device_id, device_name } => {
             let record_id = Uuid::new_v4().to_string();
             let device_id = device_id.unwrap_or_else(|| "local".to_string());
             store
                 .upsert_record(&record_id, &RecordUpsert {
-                    username, cp_aic, info1, info2, device_id,
+                    ghname, loginname, cp_aic, info1, info2, device_id, device_name,
                 })
                 .await?;
             println!("created {record_id}");
@@ -164,17 +177,19 @@ async fn main() -> Result<()> {
             print_record(&store, &record_id.to_string()).await;
             Ok(())
         }
-        Command::Update { record_id, username, cp_aic, info1, info2 } => {
+        Command::Update { record_id, ghname, loginname, cp_aic, info1, info2, device_name } => {
             let Some(current) = store.read_record(&record_id.to_string()).await? else {
                 eprintln!("record '{record_id}' not found");
                 std::process::exit(1);
             };
             let upsert = RecordUpsert {
-                username: username.unwrap_or(current.username),
+                ghname: ghname.unwrap_or(current.ghname),
+                loginname: loginname.unwrap_or(current.loginname),
                 cp_aic: cp_aic.unwrap_or(current.cp_aic),
                 info1: info1.unwrap_or(current.info1),
                 info2: info2.unwrap_or(current.info2),
                 device_id: current.device_id,
+                device_name: device_name.unwrap_or(current.device_name),
             };
             store.upsert_record(&record_id.to_string(), &upsert).await?;
             println!("updated {record_id}");
@@ -300,9 +315,14 @@ struct Record {
     record_id: String,
     /// ISO 8601 timestamp with local offset, e.g. `2026-10-14T15:00:00+08:00`.
     updated_at: String,
-    username: String,
+    /// GitHub-style display name.
+    ghname: String,
+    /// Login/account name.
+    loginname: String,
     cp_aic: f64,
+    /// Iroh node ID of the device that owns/last wrote this record.
     device_id: String,
+    device_name: String,
     info1: String,
     info2: String,
 }
@@ -311,9 +331,11 @@ struct Record {
 /// `updated_at`, which are managed: UUID at creation, timestamp on write).
 #[derive(Debug, Clone)]
 struct RecordUpsert {
-    username: String,
+    ghname: String,
+    loginname: String,
     cp_aic: f64,
     device_id: String,
+    device_name: String,
     info1: String,
     info2: String,
 }
@@ -322,10 +344,10 @@ impl std::fmt::Display for Record {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ \"record_id\": {:?}, \"updated_at\": {:?}, \"username\": {:?}, \"cp_aic\": {}, \
-             \"device_id\": {:?}, \"info1\": {:?}, \"info2\": {:?} }}",
-            self.record_id, self.updated_at, self.username, self.cp_aic,
-            self.device_id, self.info1, self.info2
+            "{{ \"record_id\": {:?}, \"updated_at\": {:?}, \"ghname\": {:?}, \"loginname\": {:?}, \
+             \"cp_aic\": {}, \"device_id\": {:?}, \"device_name\": {:?}, \"info1\": {:?}, \"info2\": {:?} }}",
+            self.record_id, self.updated_at, self.ghname, self.loginname,
+            self.cp_aic, self.device_id, self.device_name, self.info1, self.info2
         )
     }
 }
@@ -421,9 +443,11 @@ impl Store {
         Ok(Some(Record {
             record_id: record_id.to_string(),
             updated_at: get_str("updated_at")?,
-            username: get_str("username")?,
+            ghname: get_str("ghname")?,
+            loginname: get_str("loginname")?,
             cp_aic,
             device_id: get_str("device_id")?,
+            device_name: get_str("device_name")?,
             info1: get_str("info1")?,
             info2: get_str("info2")?,
         }))
@@ -441,9 +465,11 @@ impl Store {
                 .doc
                 .put(&rec, "updated_at", Self::now_iso8601())
                 .anyerr()?;
-            inner.doc.put(&rec, "username", &fields.username).anyerr()?;
+            inner.doc.put(&rec, "ghname", &fields.ghname).anyerr()?;
+            inner.doc.put(&rec, "loginname", &fields.loginname).anyerr()?;
             inner.doc.put(&rec, "cp_aic", fields.cp_aic).anyerr()?;
             inner.doc.put(&rec, "device_id", &fields.device_id).anyerr()?;
+            inner.doc.put(&rec, "device_name", &fields.device_name).anyerr()?;
             inner.doc.put(&rec, "info1", &fields.info1).anyerr()?;
             inner.doc.put(&rec, "info2", &fields.info2).anyerr()?;
         }

@@ -10,11 +10,13 @@ A P2P distributed data store built on **iroh** (QUIC, NAT traversal, no central 
 
 ```json
 {
-  "record_id": "aa185164-5c44-4197-bf5d-cc60f91468d7",
-  "updated_at": "2026-10-14T08:14:26+00:00",
-  "username": "OA",
+  "record_id": "1eea15db-86e4-43b9-b732-84eb222ff659",
+  "updated_at": "2026-10-15T02:28:30+00:00",
+  "ghname": "oahsiao",
+  "loginname": "v-oahsiao",
   "cp_aic": 87226,
   "device_id": "local",
+  "device_name": "MY-PC",
   "info1": "xx",
   "info2": "yy"
 }
@@ -22,7 +24,12 @@ A P2P distributed data store built on **iroh** (QUIC, NAT traversal, no central 
 
 - `record_id` — 建立時自動產生的 UUID v4
 - `updated_at` — ISO 8601 時間戳，每次寫入自動更新。預設 UTC (`+00:00`)；在節點環境設 `M2_TZ_OFFSET_MINUTES=480` 即輸出 `+08:00` 這類本機時區偏移
+- `ghname` — 顯示名（GitHub 風格，如 `oahsiao`）
+- `loginname` — 帳號名（如 `v-oahsiao`）
 - `device_id` — 可選，預設 `"local"`，通常放 iroh endpoint ID 標記資料來源
+- `device_name` — 人類可讀的裝置名（如 `MY-PC`）
+
+> Schema 變更提醒：舊版的 `username` 已由 `ghname` + `loginname` 取代，並新增 `device_name`。舊版程式寫出的 `doc.automerge` 仍保留舊欄位名，新程式讀取時對應欄位為空字串；請刪除舊 data-dir 重新開始。
 
 ## 架構
 
@@ -79,20 +86,20 @@ mdns discovery: enabled (LAN peers are discovered automatically)
 
 ```bash
 # 新增（record_id 自動產生 UUID，updated_at 自動蓋時間）
-.\target\debug\M2_P2P_DB.exe --data-dir nodeA create --username OA --cp-aic 87226 --info1 xx --info2 yy
+.\target\debug\M2_P2P_DB.exe --data-dir nodeA create --ghname oahsiao --loginname v-oahsiao --cp-aic 87226 --info1 xx --info2 yy --device-name MY-PC
 
 # 輸出：
-# created b4007d1d-156c-4631-8a09-f4e746e845f4
-# { "record_id": "b4007d1d-...", "updated_at": "...", "username": "OA", ... }
+# created 1eea15db-86e4-43b9-b732-84eb222ff659
+# { "record_id": "1eea15db-...", "updated_at": "...", "ghname": "oahsiao", "loginname": "v-oahsiao", ... }
 
 # 讀取（用上面記下的 UUID）
-.\target\debug\M2_P2P_DB.exe --data-dir nodeA read b4007d1d-156c-4631-8a09-f4e746e845f4
+.\target\debug\M2_P2P_DB.exe --data-dir nodeA read 1eea15db-86e4-43b9-b732-84eb222ff659
 
 # 更新（只給要改的欄位，updated_at 自動重蓋）
-.\target\debug\M2_P2P_DB.exe --data-dir nodeA update b4007d1d-156c-4631-8a09-f4e746e845f4 --cp-aic 90000
+.\target\debug\M2_P2P_DB.exe --data-dir nodeA update 1eea15db-86e4-43b9-b732-84eb222ff659 --cp-aic 90000 --device-name NEW-PC
 
 # 刪除
-.\target\debug\M2_P2P_DB.exe --data-dir nodeA delete b4007d1d-156c-4631-8a09-f4e746e845f4
+.\target\debug\M2_P2P_DB.exe --data-dir nodeA delete 1eea15db-86e4-43b9-b732-84eb222ff659
 
 # 列出節點上全部紀錄
 .\target\debug\M2_P2P_DB.exe --data-dir nodeA list

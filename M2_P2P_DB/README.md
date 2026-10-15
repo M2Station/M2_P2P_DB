@@ -8,17 +8,21 @@ Each record has exactly these fields (stored under `record:<uuid>` in the Autome
 
 ```json
 {
-  "record_id": "aa185164-5c44-4197-bf5d-cc60f91468d7",
-  "updated_at": "2026-10-14T08:14:26+00:00",
-  "username": "OA",
+  "record_id": "1eea15db-86e4-43b9-b732-84eb222ff659",
+  "updated_at": "2026-10-15T02:28:30+00:00",
+  "ghname": "oahsiao",
+  "loginname": "v-oahsiao",
   "cp_aic": 87226,
   "device_id": "local",
+  "device_name": "MY-PC",
   "info1": "xx",
   "info2": "yy"
 }
 ```
 
-`record_id` is a fresh UUID at creation; `updated_at` is an ISO 8601 timestamp stamped on every write. The local UTC offset defaults to `+00:00`; set `M2_TZ_OFFSET_MINUTES=480` (for UTC+8) on the node's environment to emit local-offset timestamps.
+`record_id` is a fresh UUID at creation; `updated_at` is an ISO 8601 timestamp stamped on every write. `ghname` is the display name, `loginname` the account name. `device_id` marks the owning node's endpoint ID (defaults to `"local"`); `device_name` is a human-readable device name. The local UTC offset defaults to `+00:00`; set `M2_TZ_OFFSET_MINUTES=480` (for UTC+8) on the node's environment to emit local-offset timestamps.
+
+> Schema note: the earlier `username` field was replaced by `ghname` + `loginname`, and `device_name` was added. Existing `doc.automerge` files written by older builds keep the old field names — new records read them as empty strings. Delete the data dir to start fresh.
 
 ## Build
 
@@ -47,9 +51,9 @@ cargo run -p M2_P2P_DB -- --data-dir nodeB listen
 Terminal 3 — CRUD:
 
 ```bash
-cargo run -p M2_P2P_DB -- --data-dir nodeA create --username OA --cp-aic 87226 --info1 xx --info2 yy
+cargo run -p M2_P2P_DB -- --data-dir nodeA create --ghname oahsiao --loginname v-oahsiao --cp-aic 87226 --info1 xx --info2 yy --device-name MY-PC
 cargo run -p M2_P2P_DB -- --data-dir nodeA read <record-id>
-cargo run -p M2_P2P_DB -- --data-dir nodeA update <record-id> --cp-aic 90000
+cargo run -p M2_P2P_DB -- --data-dir nodeA update <record-id> --cp-aic 90000 --device-name NEW-PC
 cargo run -p M2_P2P_DB -- --data-dir nodeA delete <record-id>
 cargo run -p M2_P2P_DB -- --data-dir nodeA list
 ```

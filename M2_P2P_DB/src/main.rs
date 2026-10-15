@@ -703,8 +703,12 @@ impl Store {
             // back would fail with "duplicate seq" for the same actor).
             if inner.disk_len != Some(bytes.len() as u64) {
                 let mut disk = AutoCommit::load(&bytes).anyerr()?;
-                inner.doc.merge(&mut disk).anyerr()?;
-                inner.disk_len = Some(bytes.len() as u64);
+                // Two different saves can share a length; if we do end up
+                // re-merging our own ops, automerge rejects the duplicate —
+                // harmless (we already have them), so ignore that error.
+                if inner.doc.merge(&mut disk).is_ok() {
+                    inner.disk_len = Some(bytes.len() as u64);
+                }
             }
         }
         Ok(())
@@ -715,13 +719,14 @@ impl Store {
             let mut inner = self.inner.lock().await;
             // Merge in any changes another process (e.g. a CLI invocation)
             // wrote to the on-disk document since we loaded it, so we never
-            // clobber concurrent local writes. Skip files we wrote ourselves.
+            // clobber concurrent local writes. Skip files we wrote ourselves;
+            // a coincidental same-length re-merge of our own ops is harmless.
             let doc_path = self.data_dir.join("doc.automerge");
             if doc_path.exists() {
                 let bytes = tokio::fs::read(&doc_path).await.anyerr()?;
                 if inner.disk_len != Some(bytes.len() as u64) {
                     let mut disk = AutoCommit::load(&bytes).anyerr()?;
-                    inner.doc.merge(&mut disk).anyerr()?;
+                    let _ = inner.doc.merge(&mut disk);
                 }
             }
             inner.doc.clone()

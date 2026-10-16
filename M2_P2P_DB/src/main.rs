@@ -32,8 +32,9 @@
 //!     M2_P2P_DB list
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -44,7 +45,7 @@ use automerge::{
 };
 use clap::{Parser, Subcommand};
 use iroh::{
-    Endpoint, EndpointId,
+    Endpoint, EndpointId, SecretKey,
     endpoint::{Connection, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
@@ -63,6 +64,47 @@ const PEER_PREFIX: &str = "peer:";
 
 /// Key prefix for records stored in the document (`record:<uuid>`).
 const RECORD_PREFIX: &str = "record:";
+
+/// File inside the data dir holding this node's persisted endpoint secret key
+/// (32 raw bytes). Persisting it keeps the endpoint ID stable across restarts
+/// — otherwise every restart mints a new ID, stranding the old one as a
+/// zombie `peer:` entry that every peer keeps dialing forever.
+const KEY_FILE: &str = "secret.key";
+
+/// Local (non-propagated) file recording the unix-ms of our last successful
+/// sync with each peer, so the peer list can drop nodes that have gone away
+/// for good. Deliberately *not* stored in the CRDT: it changes every round,
+/// and every write to the document is a permanent op, so a per-round
+/// timestamp there would grow the document without bound.
+const PEER_SEEN_FILE: &str = "peers.lastseen.json";
+
+/// How often the gossip loop syncs with every known peer.
+const GOSSIP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Upper bound on one peer's sync (connect + exchange). An unreachable peer is
+/// abandoned for this round rather than stalling it; the next round retries
+/// with the peer's retained sync state, so the retry is a cheap delta.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap on concurrent per-peer syncs, so a long peer list cannot open hundreds
+/// of connections at once.
+const MAX_CONCURRENT_SYNCS: usize = 32;
+
+/// A peer we have not synced with successfully for this long is dropped from
+/// the peer list (and the removal propagates to the rest of the swarm).
+const PEER_TTL: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+
+/// Whether a gossip round's outcome permits expiring peers.
+///
+/// Expiry deletes entries from the *shared* document, and that deletion
+/// propagates. A round where every peer was unreachable is indistinguishable
+/// from our own network being down, so expiring then would let a node that was
+/// offline for longer than [`PEER_TTL`] delete the whole — healthy — swarm
+/// from the document, with no way to recover the list by itself. Only expire
+/// when we actually reached someone, or when there was nobody to try.
+fn may_expire_peers(attempted: usize, any_reached: bool) -> bool {
+    attempted == 0 || any_reached
+}
 
 /// (Records live directly under the automerge ROOT, keyed by
 /// `record:<uuid>`. A shared wrapper map is an Automerge anti-pattern:
@@ -210,8 +252,39 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Load this node's endpoint secret key from `data_dir`, generating and
+/// persisting one on first run.
+///
+/// Keeping the key stable across restarts keeps the endpoint ID stable, which
+/// is what makes the peer list (and mDNS/`connect` seeds) survive a restart.
+/// The file is created with restrictive permissions where the platform
+/// supports it.
+async fn load_or_create_secret_key(data_dir: &Path) -> Result<SecretKey> {
+    let path = data_dir.join(KEY_FILE);
+    if path.exists() {
+        let bytes = tokio::fs::read(&path).await.anyerr()?;
+        let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            anyerr!("secret key file {} is corrupt: expected 32 bytes, found {}; \
+                     delete it to regenerate a fresh identity",
+                    path.display(), bytes.len())
+        })?;
+        return Ok(SecretKey::from_bytes(&arr));
+    }
+
+    let key = SecretKey::generate();
+    // Write to a temp file then rename, so a crash never leaves a partial key.
+    let tmp = data_dir.join(format!("{KEY_FILE}.tmp"));
+    tokio::fs::write(&tmp, key.to_bytes()).await.anyerr()?;
+    tokio::fs::rename(&tmp, &path).await.anyerr()?;
+    Ok(key)
+}
+
 async fn run_listen(store: Store, peers: Vec<EndpointId>) -> Result<()> {
-    let endpoint = Endpoint::bind(presets::N0).await?;
+    let secret_key = load_or_create_secret_key(&store.data_dir).await?;
+    let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(secret_key)
+        .bind()
+        .await?;
     let router = Router::builder(endpoint.clone())
         .accept(ALPN, SyncHandler(store.clone()))
         .spawn();
@@ -274,7 +347,7 @@ async fn run_listen(store: Store, peers: Vec<EndpointId>) -> Result<()> {
     // Gossip loop: periodically sync with every peer known from the
     // document. Learned peers propagate automatically, so a new node only
     // needs to reach one existing node to converge with the whole swarm.
-    let mut ticker = tokio::time::interval(Duration::from_secs(30));
+    let mut ticker = tokio::time::interval(GOSSIP_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let gossip_store = store.clone();
     let gossip_endpoint = endpoint.clone();
@@ -290,13 +363,80 @@ async fn run_listen(store: Store, peers: Vec<EndpointId>) -> Result<()> {
                     continue;
                 }
             };
+            let self_id = gossip_endpoint.id();
+
+            // Give any newly learned peer an expiry baseline before we dial it,
+            // so a peer we never manage to reach still ages out after 3 days.
+            let to_seed: Vec<EndpointId> =
+                known.iter().copied().filter(|p| *p != self_id).collect();
+            gossip_store.seed_peer_baselines(&to_seed).await;
+
+            // Sync every peer concurrently, bounded by a semaphore so a long
+            // peer list cannot open hundreds of connections at once. Each sync
+            // has its own timeout: one unreachable peer consumes only its own
+            // slot and is abandoned for this round, instead of stalling every
+            // peer queued behind it (which is what starved the swarm before).
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SYNCS));
+            let mut tasks = tokio::task::JoinSet::new();
             for peer in known {
-                if peer == gossip_endpoint.id() {
+                if peer == self_id {
                     continue;
                 }
-                if let Err(e) = gossip_store.sync_once(&gossip_endpoint, peer).await {
-                    tracing::debug!("gossip sync with {peer} failed: {e}");
+                let store = gossip_store.clone();
+                let endpoint = gossip_endpoint.clone();
+                let sem = sem.clone();
+                // Each task reports whether it reached the peer, so the round
+                // can tell "the others went away" from "we are the ones who
+                // are offline".
+                tasks.spawn(async move {
+                    let _permit = match sem.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => return None,
+                    };
+                    match tokio::time::timeout(SYNC_TIMEOUT, store.sync_once(&endpoint, peer)).await
+                    {
+                        Ok(Ok(())) => {
+                            store.mark_peer_seen(peer).await;
+                            Some(())
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!("gossip sync with {peer} failed: {e}");
+                            None
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                "gossip sync with {peer} timed out after {}s",
+                                SYNC_TIMEOUT.as_secs()
+                            );
+                            None
+                        }
+                    }
+                });
+            }
+            let mut any_reached = false;
+            let mut attempted = 0usize;
+            while let Some(joined) = tasks.join_next().await {
+                attempted += 1;
+                if matches!(joined, Ok(Some(()))) {
+                    any_reached = true;
                 }
+            }
+
+            // Persist what we learned, then expire peers that have gone for
+            // good — but only if we actually reached someone this round. A
+            // round in which *every* peer is unreachable is indistinguishable
+            // from our own network being down, and expiry here is a permanent,
+            // propagating deletion: a node that was offline for 3 days would
+            // otherwise delete the entire — healthy — swarm from the shared
+            // document, and could not recover the list on its own.
+            gossip_store.save_peer_seen().await;
+            if may_expire_peers(attempted, any_reached) {
+                gossip_store.expire_stale_peers(self_id).await;
+            } else {
+                tracing::debug!(
+                    "skipping peer expiry: no peer was reachable this round, \
+                     so we may be the one that is offline"
+                );
             }
         }
     });
@@ -357,6 +497,18 @@ impl std::fmt::Display for Record {
 struct Store {
     inner: std::sync::Arc<Mutex<StoreInner>>,
     data_dir: PathBuf,
+    /// Serialises the read-merge-write sequence of `persist_snapshot` and
+    /// `remove_peers`. `inner` alone is not enough: the disk read in between
+    /// has to be part of the same critical section, or two concurrent savers
+    /// can each merge the same on-disk state and write it back.
+    persist_lock: std::sync::Arc<Mutex<()>>,
+    /// Distinguishes the temp file each on-disk write uses, so concurrent
+    /// saves cannot overwrite each other's temp file (used by both the
+    /// document and the last-seen table).
+    tmp_seq: std::sync::Arc<AtomicU64>,
+    /// When we last synced successfully with each peer (unix ms). Local only,
+    /// used to expire peers that have left for good. See [`PEER_SEEN_FILE`].
+    peer_seen: std::sync::Arc<Mutex<std::collections::HashMap<EndpointId, u64>>>,
 }
 
 #[derive(Debug)]
@@ -380,6 +532,21 @@ impl Store {
         } else {
             (AutoCommit::new(), None)
         };
+        // Load local last-synced timestamps. A corrupt or missing file just
+        // means "we don't know yet"; peers are then only dropped once we have
+        // an observation to act on, so this never mass-deletes the peer list.
+        let seen_path = data_dir.join(PEER_SEEN_FILE);
+        let peer_seen = match tokio::fs::read(&seen_path).await {
+            Ok(bytes) => serde_json::from_slice::<std::collections::HashMap<String, u64>>(&bytes)
+                .map(|m| {
+                    m.into_iter()
+                        .filter_map(|(k, v)| EndpointId::from_str(&k).ok().map(|id| (id, v)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => Default::default(),
+        };
+
         Ok(Self {
             inner: std::sync::Arc::new(Mutex::new(StoreInner {
                 doc,
@@ -387,14 +554,20 @@ impl Store {
                 disk_len,
             })),
             data_dir: data_dir.clone(),
+            persist_lock: std::sync::Arc::new(Mutex::new(())),
+            tmp_seq: std::sync::Arc::new(AtomicU64::new(0)),
+            peer_seen: std::sync::Arc::new(Mutex::new(peer_seen)),
         })
     }
 
     async fn persist(&self, doc: &mut AutoCommit) -> Result<()> {
         let path = self.data_dir.join("doc.automerge");
         let bytes = doc.save();
-        // Write to a temp file then rename for basic crash safety.
-        let tmp = self.data_dir.join("doc.automerge.tmp");
+        // Write to a temp file then rename for basic crash safety. The temp
+        // name is unique per call so concurrent saves cannot clobber each
+        // other's temp file (the rename itself is atomic).
+        let n = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
+        let tmp = self.data_dir.join(format!("doc.automerge.{n}.tmp"));
         tokio::fs::write(&tmp, bytes).await.anyerr()?;
         tokio::fs::rename(&tmp, &path).await.anyerr()?;
         Ok(())
@@ -514,6 +687,7 @@ impl Store {
     /// saw them).
     async fn add_peers(&self, peers: &[EndpointId]) -> Result<()> {
         let mut changed = false;
+        let mut newly_seeded = Vec::new();
         {
             let mut inner = self.inner.lock().await;
             for peer in peers {
@@ -521,11 +695,26 @@ impl Store {
                 if inner.doc.get(ROOT, &key).anyerr()?.is_none() {
                     inner.doc.put(ROOT, &key, Self::now_ms()).anyerr()?;
                     changed = true;
+                    newly_seeded.push(*peer);
                 }
+            }
+        }
+        // Give every peer a last-seen baseline the moment we learn about it.
+        // Without this, a peer we have *never* reached (the usual zombie case:
+        // an ID that a restart orphaned) would have no entry and so be exempt
+        // from expiry forever — exactly the entry we most need to drop. With a
+        // baseline it expires 3 days after we first heard of it unless it
+        // actually syncs.
+        if !newly_seeded.is_empty() {
+            let mut seen = self.peer_seen.lock().await;
+            let now = Self::now_ms();
+            for peer in newly_seeded {
+                seen.entry(peer).or_insert(now);
             }
         }
         if changed {
             self.persist_snapshot().await?;
+            self.save_peer_seen().await;
         }
         Ok(())
     }
@@ -545,17 +734,41 @@ impl Store {
         Ok(out)
     }
 
+    /// Drop the residual `in_flight` marker a peer's sync state may carry.
+    ///
+    /// `generate_sync_message` sets `in_flight` when it hands out a message,
+    /// and only `receive_sync_message` clears it — when the peer's reply
+    /// arrives. If an exchange ends any other way (the peer closed first, an
+    /// I/O error, or our own timeout), the flag stays set and every later
+    /// `generate_sync_message` returns `None`: the peer would sit silently
+    /// "in sync" forever while sending and receiving nothing.
+    ///
+    /// Clearing it is safe because the protocol is a delta exchange: the next
+    /// message is generated from current heads and the peer ignores changes it
+    /// already has. This is called at the *start* of a round rather than after
+    /// a failure because a timeout drops the sync future mid-await — code
+    /// after that future's `.await` never runs.
+    async fn reset_sync_state(&self, peer: EndpointId) {
+        let mut inner = self.inner.lock().await;
+        if let Some(state) = inner.sync_states.get_mut(&peer) {
+            state.in_flight = false;
+        }
+    }
+
     /// Run the automerge sync protocol with a remote peer over one iroh bi-stream.
     ///
     /// Note: does NOT close the endpoint — `listen` nodes share one endpoint
     /// across gossip rounds and incoming connections. Callers that own a
     /// dedicated endpoint (the `connect` command) close it themselves.
     async fn sync_once(&self, endpoint: &Endpoint, peer: EndpointId) -> Result<()> {
+        // A fresh round always starts clean: whatever the previous exchange did
+        // for this peer, its connection is gone now. See `reset_sync_state`.
+        self.reset_sync_state(peer).await;
         let conn = endpoint.connect(peer, ALPN).await.anyerr()?;
         let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
-        self.run_sync(&mut send, &mut recv, peer).await?;
+        let res = self.run_sync(&mut send, &mut recv, peer).await;
         conn.close(0u32.into(), b"done");
-        Ok(())
+        res
     }
 
     /// Sync loop against a single remote over provided streams.
@@ -630,6 +843,12 @@ impl ProtocolHandler for SyncHandler {
         // The initiator drives; we just respond. Mirror their framing.
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Start every connection's exchange from a clean sync state. A
+            // previous exchange that ended without the peer's reply (dropped
+            // connection, our own read failure) leaves `in_flight` set, which
+            // would make every `generate_sync_message` below return `None` and
+            // leave us mute to this peer forever. See `reset_sync_state`.
+            store.reset_sync_state(peer).await;
             let res: Result<()> = loop {
                 // Pick up any changes written to disk by other processes.
                 if let Err(e) = store.refresh().await {
@@ -684,6 +903,10 @@ impl ProtocolHandler for SyncHandler {
             }
             // Remember the peer in the document so it propagates to others.
             let _ = store.add_peers(std::slice::from_ref(&peer)).await;
+            // An inbound sync proves the peer is alive, so refresh its
+            // last-seen and keep it from being expired.
+            store.mark_peer_seen(peer).await;
+            store.save_peer_seen().await;
             let _ = store.persist_snapshot().await;
             connection.closed().await;
         });
@@ -715,6 +938,12 @@ impl Store {
     }
 
     async fn persist_snapshot(&self) -> Result<()> {
+        // Hold the persist lock across the whole read-merge-write sequence:
+        // concurrent sync tasks each call this, and without serialising it
+        // two of them can read the same on-disk state and save over each other
+        // (losing one side's document updates), even though the map writes
+        // themselves go through `inner`.
+        let _guard = self.persist_lock.lock().await;
         let mut doc = {
             let mut inner = self.inner.lock().await;
             // Merge in any changes another process (e.g. a CLI invocation)
@@ -737,6 +966,96 @@ impl Store {
             inner.disk_len = Some(doc.save().len() as u64);
         }
         self.persist(&mut doc).await
+    }
+
+    /// Record that we just synced successfully with `peer`. Local only — this
+    /// timestamp is what the 3-day expiry is measured against.
+    async fn mark_peer_seen(&self, peer: EndpointId) {
+        let mut seen = self.peer_seen.lock().await;
+        seen.insert(peer, Self::now_ms());
+    }
+
+    /// Start the expiry clock for peers we are about to dial but have no
+    /// last-seen for. Peers arrive mostly by syncing the document (their
+    /// `peer:` keys propagate), which does not go through `add_peers`, so
+    /// without this they would have no baseline and never expire.
+    async fn seed_peer_baselines(&self, peers: &[EndpointId]) {
+        let mut seen = self.peer_seen.lock().await;
+        let now = Self::now_ms();
+        for peer in peers {
+            seen.entry(*peer).or_insert(now);
+        }
+    }
+
+    /// Persist the last-seen table to disk so the expiry baseline survives a
+    /// restart (otherwise every restart would look like "never seen anyone").
+    async fn save_peer_seen(&self) {
+        let snapshot: std::collections::HashMap<String, u64> = {
+            let seen = self.peer_seen.lock().await;
+            seen.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+        };
+        let path = self.data_dir.join(PEER_SEEN_FILE);
+        // Unique temp name, for the same reason as `persist`: several tasks
+        // (each inbound connection, each gossip round) call this concurrently.
+        let n = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
+        let tmp = self.data_dir.join(format!("{PEER_SEEN_FILE}.{n}.tmp"));
+        if let Ok(bytes) = serde_json::to_vec(&snapshot)
+            && tokio::fs::write(&tmp, bytes).await.is_ok()
+        {
+            let _ = tokio::fs::rename(&tmp, &path).await;
+        }
+    }
+
+    /// Drop peers from the document (and the local last-seen table) so they
+    /// stop being dialled. Automerge removes propagate through sync like any
+    /// other change, reaching the rest of the swarm.
+    async fn remove_peers(&self, peers: &[EndpointId]) -> Result<()> {
+        if peers.is_empty() {
+            return Ok(());
+        }
+        // Mutate the in-memory doc first, then let `persist_snapshot` take the
+        // persist lock itself. Do not hold it here: the lock is not reentrant,
+        // and `persist_snapshot` needs it for its own read-merge-write.
+        {
+            let mut inner = self.inner.lock().await;
+            for peer in peers {
+                let key = format!("{PEER_PREFIX}{peer}");
+                inner.doc.delete(ROOT, &key).anyerr()?;
+            }
+        }
+        self.persist_snapshot().await?;
+        {
+            let mut seen = self.peer_seen.lock().await;
+            for peer in peers {
+                seen.remove(peer);
+            }
+        }
+        self.save_peer_seen().await;
+        Ok(())
+    }
+
+    /// Expire peers we have not synced with successfully for longer than
+    /// [`PEER_TTL`]. A peer with no recorded last-seen is left alone: we have
+    /// no observation to justify dropping it, and dropping it would risk
+    /// pruning a node that is simply not yet reachable from here.
+    async fn expire_stale_peers(&self, self_id: EndpointId) {
+        let cutoff = Self::now_ms().saturating_sub(PEER_TTL.as_millis() as u64);
+        let stale: Vec<EndpointId> = {
+            let seen = self.peer_seen.lock().await;
+            seen.iter()
+                .filter(|(id, last)| **id != self_id && **last < cutoff)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        if stale.is_empty() {
+            return;
+        }
+        for peer in &stale {
+            tracing::info!("expiring peer {peer}: no successful sync within 3 days");
+        }
+        if let Err(e) = self.remove_peers(&stale).await {
+            tracing::warn!("failed to remove expired peers: {e}");
+        }
     }
 }
 
@@ -801,4 +1120,325 @@ fn civil_from_unix(secs: u64) -> (String, String, String) {
         format!("{h:02}:{m:02}:{s:02}"),
         format!("{sign}{oh:02}:{om:02}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique scratch data dir per test, cleaned up on drop.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let n = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let p = std::env::temp_dir().join(format!("m2p2p-test-{tag}-{n}"));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A syntactically valid, distinct endpoint ID per `seed`.
+    fn peer(seed: u8) -> EndpointId {
+        let key = SecretKey::from_bytes(&[seed; 32]);
+        key.public()
+    }
+
+    #[tokio::test]
+    async fn secret_key_is_stable_across_reopen() {
+        let dir = TempDir::new("key");
+        let first = load_or_create_secret_key(dir.path()).await.unwrap();
+        let second = load_or_create_secret_key(dir.path()).await.unwrap();
+        assert_eq!(
+            first.public(),
+            second.public(),
+            "endpoint ID must survive a restart, or peers keep dialing a dead ID"
+        );
+        // Persisted as exactly 32 raw bytes.
+        let raw = std::fs::read(dir.path().join(KEY_FILE)).unwrap();
+        assert_eq!(raw.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn corrupt_secret_key_is_rejected() {
+        let dir = TempDir::new("key-bad");
+        std::fs::write(dir.path().join(KEY_FILE), b"not-32-bytes").unwrap();
+        assert!(load_or_create_secret_key(dir.path()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn peers_older_than_ttl_are_expired() {
+        let dir = TempDir::new("expire");
+        let store = Store::open(&dir.0).await.unwrap();
+        let me = peer(1);
+        let fresh = peer(2);
+        let zombie = peer(3);
+
+        store.add_peers(&[me, fresh, zombie]).await.unwrap();
+        // `fresh` synced a moment ago; `zombie` was last seen 4 days ago.
+        store.peer_seen.lock().await.insert(
+            zombie,
+            Store::now_ms() - (PEER_TTL.as_millis() as u64) - 1000,
+        );
+
+        assert_eq!(store.known_peers().await.unwrap().len(), 3);
+        store.expire_stale_peers(me).await;
+
+        let remaining = store.known_peers().await.unwrap();
+        assert!(!remaining.contains(&zombie), "zombie peer must be dropped");
+        assert!(remaining.contains(&fresh), "recently seen peer must be kept");
+        assert!(remaining.contains(&me), "we must never expire ourselves");
+    }
+
+    #[tokio::test]
+    async fn never_synced_peer_still_gets_a_baseline_and_expires() {
+        // The zombie case: we learned a peer's ID but never once reached it.
+        // It must still have an expiry clock, or it would live forever.
+        let dir = TempDir::new("baseline");
+        let store = Store::open(&dir.0).await.unwrap();
+        let me = peer(1);
+        let unreachable = peer(4);
+
+        // Learned from the document, not via add_peers.
+        store.seed_peer_baselines(&[unreachable]).await;
+        assert!(store.peer_seen.lock().await.contains_key(&unreachable));
+
+        // Age it past the TTL.
+        store.peer_seen.lock().await.insert(
+            unreachable,
+            Store::now_ms() - (PEER_TTL.as_millis() as u64) - 1000,
+        );
+        store.add_peers(&[unreachable]).await.unwrap();
+        store.expire_stale_peers(me).await;
+        assert!(!store.known_peers().await.unwrap().contains(&unreachable));
+    }
+
+    #[tokio::test]
+    async fn concurrent_persist_keeps_every_write() {
+        // Regression guard for the temp-file collision: many concurrent sync
+        // tasks each persist; no save may silently clobber another.
+        let dir = TempDir::new("persist");
+        let store = Store::open(&dir.0).await.unwrap();
+        let mut tasks = Vec::new();
+        for i in 0..16u8 {
+            let s = store.clone();
+            tasks.push(tokio::spawn(async move {
+                let id = Uuid::new_v4().to_string();
+                s.upsert_record(
+                    &id,
+                    &RecordUpsert {
+                        ghname: format!("u{i}"),
+                        loginname: "l".into(),
+                        cp_aic: i as f64,
+                        device_id: "local".into(),
+                        device_name: "d".into(),
+                        info1: String::new(),
+                        info2: String::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        // Reopen from disk: every record must have survived the concurrent saves.
+        let reopened = Store::open(&dir.0).await.unwrap();
+        assert_eq!(reopened.list_records().await.unwrap().len(), 16);
+    }
+
+    #[tokio::test]
+    async fn gossip_syncs_all_peers_concurrently_despite_one_dead() {
+        // The core fix: an unreachable peer must not stop the others, and must
+        // not hold the round for longer than its own timeout.
+        use iroh::protocol::Router;
+
+        let dir_a = TempDir::new("swarm-a");
+        let dir_b = TempDir::new("swarm-b");
+        let store_b = Store::open(&dir_b.0).await.unwrap();
+        let key_b = load_or_create_secret_key(dir_b.path()).await.unwrap();
+        let ep_b = Endpoint::builder(presets::N0)
+            .secret_key(key_b)
+            .bind()
+            .await
+            .unwrap();
+        let router_b = Router::builder(ep_b.clone())
+            .accept(ALPN, SyncHandler(store_b.clone()))
+            .spawn();
+        ep_b.online().await;
+
+        let store_a = Store::open(&dir_a.0).await.unwrap();
+        let key_a = load_or_create_secret_key(dir_a.path()).await.unwrap();
+        let ep_a = Endpoint::builder(presets::N0)
+            .secret_key(key_a)
+            .bind()
+            .await
+            .unwrap();
+
+        // Give B a record A does not have yet.
+        let rid = Uuid::new_v4().to_string();
+        store_b
+            .upsert_record(
+                &rid,
+                &RecordUpsert {
+                    ghname: "b".into(),
+                    loginname: "b".into(),
+                    cp_aic: 1.0,
+                    device_id: "local".into(),
+                    device_name: "B".into(),
+                    info1: String::new(),
+                    info2: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // A knows one real peer (B) and one dead one (a random key nobody runs).
+        let dead = peer(99);
+        let started = std::time::Instant::now();
+        let (live, _dead) = tokio::join!(
+            tokio::time::timeout(SYNC_TIMEOUT, store_a.sync_once(&ep_a, ep_b.id())),
+            tokio::time::timeout(SYNC_TIMEOUT, store_a.sync_once(&ep_a, dead)),
+        );
+        assert!(live.is_ok() && live.unwrap().is_ok(), "live peer must sync");
+
+        // The live sync must complete promptly, not wait on the dead peer's
+        // full timeout — that serial stall is what starved the swarm before.
+        assert!(
+            started.elapsed() < SYNC_TIMEOUT,
+            "live sync must not be blocked by the unreachable peer"
+        );
+        assert!(
+            store_a.read_record(&rid).await.unwrap().is_some(),
+            "record must have arrived from B and persisted"
+        );
+
+        router_b.shutdown().await.unwrap();
+        ep_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_sync_does_not_latch_in_flight() {
+        // Regression guard for a bug the first cut of the timeout work had:
+        // the fix-up ran *after* `sync_once().await`, so a timeout — which
+        // drops that future mid-await — skipped it entirely. The peer's sync
+        // state then kept `in_flight = true` forever, and since
+        // `generate_sync_message` returns `None` while it is set, that peer
+        // was silently mute for the life of the process.
+        //
+        // Reproduce the exact condition: leave a state marked in_flight, then
+        // run a round that times out, and assert the state comes out clean.
+        use iroh::protocol::Router;
+
+        /// Accepts the stream but never replies, so the initiator's read
+        /// blocks until its own timeout fires — the timeout path we are
+        /// guarding, as opposed to an ordinary connection error.
+        #[derive(Debug)]
+        struct HangingHandler;
+        impl ProtocolHandler for HangingHandler {
+            async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+                let (_send, _recv) = connection.accept_bi().await.map_err(AcceptError::from_err)?;
+                // Hold the connection open forever without answering.
+                std::future::pending::<Result<(), AcceptError>>().await
+            }
+        }
+
+        let dir_peer = TempDir::new("dead-peer");
+        let key_peer = load_or_create_secret_key(dir_peer.path()).await.unwrap();
+        let ep_peer = Endpoint::builder(presets::N0)
+            .secret_key(key_peer)
+            .bind()
+            .await
+            .unwrap();
+        let router_peer = Router::builder(ep_peer.clone())
+            .accept(ALPN, HangingHandler)
+            .spawn();
+        ep_peer.online().await;
+
+        let dir_a = TempDir::new("dead-initiator");
+        let store_a = Store::open(&dir_a.0).await.unwrap();
+        let key_a = load_or_create_secret_key(dir_a.path()).await.unwrap();
+        let ep_a = Endpoint::builder(presets::N0)
+            .secret_key(key_a)
+            .bind()
+            .await
+            .unwrap();
+
+        let target = ep_peer.id();
+        // Simulate the residue a previous cut-short exchange leaves behind.
+        store_a
+            .inner
+            .lock()
+            .await
+            .sync_states
+            .entry(target)
+            .or_insert_with(sync::State::new)
+            .in_flight = true;
+
+        // A round against a peer that goes silent must time out...
+        let short = Duration::from_millis(500);
+        let r = tokio::time::timeout(short, store_a.sync_once(&ep_a, target)).await;
+        assert!(r.is_err(), "sync should have hit the timeout");
+
+        // ...and must leave the state usable, so the next round can send again.
+        let latched = store_a
+            .inner
+            .lock()
+            .await
+            .sync_states
+            .get(&target)
+            .map(|s| s.in_flight);
+        assert_eq!(
+            latched,
+            Some(false),
+            "in_flight must be cleared for a timed-out peer, or it goes mute forever"
+        );
+
+        router_peer.shutdown().await.unwrap();
+        ep_a.close().await;
+    }
+
+    #[test]
+    fn expiry_is_skipped_when_no_peer_was_reachable() {
+        // A node offline for >PEER_TTL fails every sync; without this guard it
+        // would delete its whole (healthy) peer list from the shared document
+        // and could never recover it. See `may_expire_peers`.
+        assert!(!may_expire_peers(5, false), "offline node must not purge peers");
+        assert!(may_expire_peers(5, true), "a round that reached someone may expire");
+        // No peers to dial at all (fresh node): nothing to protect against.
+        assert!(may_expire_peers(0, false));
+    }
+
+    #[tokio::test]
+    async fn expire_stale_peers_only_touches_the_stale_ones() {
+        let dir = TempDir::new("mixed");
+        let store = Store::open(&dir.0).await.unwrap();
+        let me = peer(1);
+        let alive = peer(2);
+        let gone = peer(3);
+
+        store.add_peers(&[me, alive, gone]).await.unwrap();
+        {
+            let mut seen = store.peer_seen.lock().await;
+            let old = Store::now_ms() - (PEER_TTL.as_millis() as u64) - 1000;
+            seen.insert(gone, old);
+        }
+        store.expire_stale_peers(me).await;
+
+        let remaining = store.known_peers().await.unwrap();
+        assert!(remaining.contains(&alive), "a recently seen peer must survive");
+        assert!(!remaining.contains(&gone), "the stale peer must be dropped");
+        assert!(remaining.contains(&me));
+    }
 }

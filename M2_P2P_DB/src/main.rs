@@ -48,6 +48,7 @@ use iroh::{
     Endpoint, EndpointId, RelayMode, SecretKey,
     address_lookup::{PkarrPublisher, PkarrResolver},
     endpoint::{Connection, presets},
+    endpoint::presets::Preset,
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
@@ -216,7 +217,9 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Listen { peers } => run_listen(store, peers).await,
         Command::Connect { endpoint_id } => {
-            let endpoint = Endpoint::bind(presets::Empty).await?;
+            // Minimal.apply sets the rustls crypto provider; no
+            // address-lookups needed for a one-shot connect.
+            let endpoint = presets::Minimal.apply(Endpoint::builder(presets::Empty)).bind().await?;
             endpoint.online().await;
             store.sync_once(&endpoint, endpoint_id).await?;
             endpoint.close().await;
@@ -359,13 +362,15 @@ async fn run_listen(store: Store, peers: Vec<EndpointId>) -> Result<()> {
     // burst every few seconds; cutting DnsAddressLookup makes the DNS path
     // disappear from the steady state. Relay hostnames still resolve once
     // at startup via the default resolver, which is fine.
-    let endpoint = Endpoint::builder(presets::Empty)
+    // Minimal sets the rustls crypto provider; the rest is the same as
+    // `N0` minus the DNS-TXT address lookup that was causing the TCP burst.
+    let mut builder = presets::Minimal.apply(Endpoint::builder(presets::Empty));
+    builder = builder
         .secret_key(secret_key)
         .relay_mode(RelayMode::Default)
         .address_lookup(PkarrPublisher::n0_dns())
-        .address_lookup(PkarrResolver::n0_dns())
-        .bind()
-        .await?;
+        .address_lookup(PkarrResolver::n0_dns());
+    let endpoint = builder.bind().await?;
     let router = Router::builder(endpoint.clone())
         .accept(ALPN, SyncHandler(store.clone()))
         .spawn();

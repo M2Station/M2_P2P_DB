@@ -45,7 +45,8 @@ use automerge::{
 };
 use clap::{Parser, Subcommand};
 use iroh::{
-    Endpoint, EndpointId, SecretKey,
+    Endpoint, EndpointId, RelayMode, SecretKey,
+    address_lookup::{PkarrPublisher, PkarrResolver},
     endpoint::{Connection, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
@@ -92,7 +93,25 @@ const MAX_CONCURRENT_SYNCS: usize = 32;
 
 /// A peer we have not synced with successfully for this long is dropped from
 /// the peer list (and the removal propagates to the rest of the swarm).
-const PEER_TTL: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+///
+/// Was 3 days; dropped to 1 day because each zombie stays on the dial list
+/// for the full TTL, and a day of accumulated zombies is enough to clog
+/// the gossip round without delaying actual data exchange any further.
+const PEER_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Cap on the peer list size. When the peer list grows past this, the
+/// entries with the oldest last-seen are evicted (and removed from the
+/// document) — protects against a swarm that learns dozens of zombies in
+/// a single document-sync round, all of which would otherwise stay on the
+/// dial list until TTL.
+const MAX_PEERS: usize = 64;
+
+/// If we have never reached a peer after this many gossip rounds, drop it.
+/// This is the proactive half of zombie cleanup: TTL is reactive (waits 1
+/// day), but a peer whose ID keeps coming in via document sync can pile up
+/// faster than that, and the only signal we have is "how many rounds have
+/// we tried it". 8 rounds at the default 30 s interval ≈ 4 minutes.
+const ZOMBIE_FAIL_ROUNDS: u32 = 8;
 
 /// Whether a gossip round's outcome permits expiring peers.
 ///
@@ -178,6 +197,11 @@ enum Command {
     Delete { record_id: Uuid },
     /// List all records as JSON.
     List,
+    /// Drop zombie peers: anything in the document under `peer:` that has
+    /// either no last-seen entry or whose fail-round counter is at the cap.
+    /// Run with the node offline (no listener) so it doesn't fight an
+    /// in-flight gossip round. Safe to run repeatedly.
+    Prune,
 }
 
 #[tokio::main]
@@ -192,7 +216,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Listen { peers } => run_listen(store, peers).await,
         Command::Connect { endpoint_id } => {
-            let endpoint = Endpoint::bind(presets::N0).await?;
+            let endpoint = Endpoint::bind(presets::Empty).await?;
             endpoint.online().await;
             store.sync_once(&endpoint, endpoint_id).await?;
             endpoint.close().await;
@@ -249,6 +273,52 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Prune => {
+            // Single-shot offline cleanup. Drop every `peer:` key whose
+            // local last-seen row says zombie (fail-round cap reached, TTL
+            // expired, or no row at all = we never observed it).
+            let now = Store::now_ms();
+            let cutoff = now.saturating_sub(PEER_TTL.as_millis() as u64);
+            let stale: Vec<EndpointId> = {
+                let seen = store.peer_seen.lock().await;
+                let doc_peers: Vec<EndpointId> = {
+                    let inner = store.inner.lock().await;
+                    inner
+                        .doc
+                        .keys(ROOT)
+                        .filter_map(|k| {
+                            let s = k.to_string();
+                            s.strip_prefix(PEER_PREFIX)
+                                .and_then(|id| EndpointId::from_str(id).ok())
+                        })
+                        .collect()
+                };
+                doc_peers
+                    .into_iter()
+                    .filter(|id| match seen.get(id) {
+                        None => true, // never observed → drop
+                        Some(p) => {
+                            p.last_seen_ms != 0 && p.last_seen_ms < cutoff
+                                || p.fail_rounds >= ZOMBIE_FAIL_ROUNDS
+                        }
+                    })
+                    .collect()
+            };
+            if stale.is_empty() {
+                println!("no zombie peers to drop");
+            } else {
+                println!("dropping {} zombie peer(s) from the document:", stale.len());
+                for id in &stale {
+                    println!("  - {id}");
+                }
+                if let Err(e) = Store::remove_peers_pub(&store, &stale).await {
+                    eprintln!("prune failed: {e}");
+                    std::process::exit(1);
+                }
+                println!("done");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -281,8 +351,19 @@ async fn load_or_create_secret_key(data_dir: &Path) -> Result<SecretKey> {
 
 async fn run_listen(store: Store, peers: Vec<EndpointId>) -> Result<()> {
     let secret_key = load_or_create_secret_key(&store.data_dir).await?;
-    let endpoint = Endpoint::builder(presets::N0)
+    // Build the endpoint with only the HTTPS-based address-lookups
+    // (PkarrPublisher + PkarrResolver). The n0 preset also wires in
+    // `DnsAddressLookup::n0_dns()`, which queries DNS TXT records over UDP
+    // and, when the response is truncated, opens a fresh TCP connection per
+    // query via hickory-resolver. With peer churn we get a TCP-53 SYN/FIN
+    // burst every few seconds; cutting DnsAddressLookup makes the DNS path
+    // disappear from the steady state. Relay hostnames still resolve once
+    // at startup via the default resolver, which is fine.
+    let endpoint = Endpoint::builder(presets::Empty)
         .secret_key(secret_key)
+        .relay_mode(RelayMode::Default)
+        .address_lookup(PkarrPublisher::n0_dns())
+        .address_lookup(PkarrResolver::n0_dns())
         .bind()
         .await?;
     let router = Router::builder(endpoint.clone())
@@ -401,6 +482,11 @@ async fn run_listen(store: Store, peers: Vec<EndpointId>) -> Result<()> {
                         }
                         Ok(Err(e)) => {
                             tracing::debug!("gossip sync with {peer} failed: {e}");
+                            // Bump the proactive zombie counter even on
+                            // non-timeout failures: a peer that consistently
+                            // errors (auth failed, wrong ALPN, etc.) wastes
+                            // the same slot as a timed-out one.
+                            store.bump_peer_fail(peer).await;
                             None
                         }
                         Err(_) => {
@@ -408,6 +494,7 @@ async fn run_listen(store: Store, peers: Vec<EndpointId>) -> Result<()> {
                                 "gossip sync with {peer} timed out after {}s",
                                 SYNC_TIMEOUT.as_secs()
                             );
+                            store.bump_peer_fail(peer).await;
                             None
                         }
                     }
@@ -492,6 +579,15 @@ impl std::fmt::Display for Record {
     }
 }
 
+impl Store {
+    /// Public wrapper around the private [`Store::remove_peers`] for the
+    /// `Prune` subcommand. The method is already correct; it is just hidden
+    /// from `pub` because nothing else in the listen path needs it.
+    async fn remove_peers_pub(&self, peers: &[EndpointId]) -> Result<()> {
+        self.remove_peers(peers).await
+    }
+}
+
 /// Local document store: automerge doc + persistence + sync helpers.
 #[derive(Debug, Clone)]
 struct Store {
@@ -508,7 +604,22 @@ struct Store {
     tmp_seq: std::sync::Arc<AtomicU64>,
     /// When we last synced successfully with each peer (unix ms). Local only,
     /// used to expire peers that have left for good. See [`PEER_SEEN_FILE`].
-    peer_seen: std::sync::Arc<Mutex<std::collections::HashMap<EndpointId, u64>>>,
+    ///
+    /// The `fail_rounds` counter is the proactive zombie cleanup companion:
+    /// incremented every gossip round a peer fails to respond to, cleared
+    /// on every successful sync. When it passes [`ZOMBIE_FAIL_ROUNDS`] the
+    /// peer is dropped immediately (independent of [`PEER_TTL`]).
+    peer_seen: std::sync::Arc<Mutex<std::collections::HashMap<EndpointId, PeerSeen>>>,
+}
+
+/// One row of [`Store::peer_seen`].
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, Default)]
+struct PeerSeen {
+    /// Unix ms of the last successful sync with this peer.
+    last_seen_ms: u64,
+    /// Consecutive gossip rounds this peer has failed to respond to.
+    /// Reset to 0 on every successful sync.
+    fail_rounds: u32,
 }
 
 #[derive(Debug)]
@@ -536,14 +647,38 @@ impl Store {
         // means "we don't know yet"; peers are then only dropped once we have
         // an observation to act on, so this never mass-deletes the peer list.
         let seen_path = data_dir.join(PEER_SEEN_FILE);
+        // File shape changed: `last_seen_ms` (was `last_seen`) + new
+        // `fail_rounds`. Tolerate either the new shape or the old
+        // `{ "id": u64_ms }` so a pre-existing file still loads without
+        // re-learning every peer.
         let peer_seen = match tokio::fs::read(&seen_path).await {
-            Ok(bytes) => serde_json::from_slice::<std::collections::HashMap<String, u64>>(&bytes)
-                .map(|m| {
+            Ok(bytes) => {
+                // Try the new shape first.
+                if let Ok(m) = serde_json::from_slice::<
+                    std::collections::HashMap<String, PeerSeen>,
+                >(&bytes)
+                {
                     m.into_iter()
-                        .filter_map(|(k, v)| EndpointId::from_str(&k).ok().map(|id| (id, v)))
+                        .filter_map(|(k, v)| {
+                            EndpointId::from_str(&k).ok().map(|id| (id, v))
+                        })
                         .collect()
-                })
-                .unwrap_or_default(),
+                } else if let Ok(m) =
+                    serde_json::from_slice::<std::collections::HashMap<String, u64>>(&bytes)
+                {
+                    // Old shape: every u64 is a unix-ms timestamp; assume
+                    // a clean state for fail_rounds.
+                    m.into_iter()
+                        .filter_map(|(k, v)| {
+                            EndpointId::from_str(&k).ok().map(|id| {
+                                (id, PeerSeen { last_seen_ms: v, fail_rounds: 0 })
+                            })
+                        })
+                        .collect()
+                } else {
+                    Default::default()
+                }
+            }
             Err(_) => Default::default(),
         };
 
@@ -709,7 +844,7 @@ impl Store {
             let mut seen = self.peer_seen.lock().await;
             let now = Self::now_ms();
             for peer in newly_seeded {
-                seen.entry(peer).or_insert(now);
+                seen.entry(peer).or_insert(PeerSeen { last_seen_ms: now, fail_rounds: 0 });
             }
         }
         if changed {
@@ -969,10 +1104,14 @@ impl Store {
     }
 
     /// Record that we just synced successfully with `peer`. Local only — this
-    /// timestamp is what the 3-day expiry is measured against.
+    /// timestamp is what the 1-day expiry is measured against. Clears the
+    /// fail-round counter so a flaky peer does not get dropped mid-recovery.
     async fn mark_peer_seen(&self, peer: EndpointId) {
         let mut seen = self.peer_seen.lock().await;
-        seen.insert(peer, Self::now_ms());
+        seen.insert(
+            peer,
+            PeerSeen { last_seen_ms: Self::now_ms(), fail_rounds: 0 },
+        );
     }
 
     /// Start the expiry clock for peers we are about to dial but have no
@@ -983,14 +1122,25 @@ impl Store {
         let mut seen = self.peer_seen.lock().await;
         let now = Self::now_ms();
         for peer in peers {
-            seen.entry(*peer).or_insert(now);
+            seen.entry(*peer).or_insert(PeerSeen { last_seen_ms: now, fail_rounds: 0 });
         }
+    }
+
+    /// Record that a gossip round failed to reach `peer`. Cumulative — the
+    /// counter is reset on every successful sync by [`mark_peer_seen`].
+    /// Bumping is best-effort: if the peer has no row yet, seed it with
+    /// 1 fail round so it has a baseline to count from.
+    async fn bump_peer_fail(&self, peer: EndpointId) {
+        let mut seen = self.peer_seen.lock().await;
+        seen.entry(peer)
+            .and_modify(|p| p.fail_rounds = p.fail_rounds.saturating_add(1))
+            .or_insert(PeerSeen { last_seen_ms: Self::now_ms(), fail_rounds: 1 });
     }
 
     /// Persist the last-seen table to disk so the expiry baseline survives a
     /// restart (otherwise every restart would look like "never seen anyone").
     async fn save_peer_seen(&self) {
-        let snapshot: std::collections::HashMap<String, u64> = {
+        let snapshot: std::collections::HashMap<String, PeerSeen> = {
             let seen = self.peer_seen.lock().await;
             seen.iter().map(|(k, v)| (k.to_string(), *v)).collect()
         };
@@ -1034,24 +1184,57 @@ impl Store {
         Ok(())
     }
 
-    /// Expire peers we have not synced with successfully for longer than
-    /// [`PEER_TTL`]. A peer with no recorded last-seen is left alone: we have
-    /// no observation to justify dropping it, and dropping it would risk
+    /// Expire peers that have either gone quiet for too long (reactive —
+    /// [`PEER_TTL`]) or accumulated too many consecutive failed dials
+    /// (proactive — [`ZOMBIE_FAIL_ROUNDS`]). The proactive half is the
+    /// important one for this codebase: peers arrive in batches via document
+    /// sync, and a freshly-learned zombie stays on the dial list for the
+    /// full TTL otherwise, slowing every gossip round.
+    ///
+    /// A peer with no recorded last-seen is left alone: we have no
+    /// observation to justify dropping it, and dropping it would risk
     /// pruning a node that is simply not yet reachable from here.
     async fn expire_stale_peers(&self, self_id: EndpointId) {
         let cutoff = Self::now_ms().saturating_sub(PEER_TTL.as_millis() as u64);
-        let stale: Vec<EndpointId> = {
+        let mut stale: Vec<EndpointId> = {
             let seen = self.peer_seen.lock().await;
             seen.iter()
-                .filter(|(id, last)| **id != self_id && **last < cutoff)
-                .map(|(id, _)| *id)
+                .filter_map(|(id, p)| {
+                    if *id == self_id {
+                        return None;
+                    }
+                    let ttl_expired = p.last_seen_ms != 0 && p.last_seen_ms < cutoff;
+                    let zombie = p.fail_rounds >= ZOMBIE_FAIL_ROUNDS;
+                    if ttl_expired || zombie { Some(*id) } else { None }
+                })
                 .collect()
         };
+
+        // Cap the peer list. If we accumulated more than MAX_PEERS, evict
+        // the entries with the oldest last-seen (the ones least worth keeping).
+        // Self is always kept.
+        {
+            let seen = self.peer_seen.lock().await;
+            if seen.len() > MAX_PEERS {
+                let mut by_age: Vec<(EndpointId, u64)> = seen
+                    .iter()
+                    .map(|(id, p)| (*id, p.last_seen_ms))
+                    .collect();
+                by_age.sort_by_key(|(_, ts)| *ts);
+                let excess = seen.len() - MAX_PEERS;
+                for (id, _) in by_age.iter().take(excess) {
+                    if *id != self_id && !stale.contains(id) {
+                        stale.push(*id);
+                    }
+                }
+            }
+        }
+
         if stale.is_empty() {
             return;
         }
         for peer in &stale {
-            tracing::info!("expiring peer {peer}: no successful sync within 3 days");
+            tracing::info!("expiring peer {peer}: no recent sync (ttl or fail-round cap)");
         }
         if let Err(e) = self.remove_peers(&stale).await {
             tracing::warn!("failed to remove expired peers: {e}");
@@ -1148,6 +1331,21 @@ mod tests {
         }
     }
 
+    /// Build a sync-only endpoint for tests.
+    ///
+    /// Tests don't need the production hardening (no DnsAddressLookup, no
+    /// pkarr address-lookups), so they use the N0 preset which selects a
+    /// rustls crypto provider for them. The TCP-DNS burst this avoids is
+    /// a long-running production concern; in a 10-second unit test it
+    /// never has a chance to manifest.
+    async fn build_test_endpoint(key: SecretKey) -> iroh::Endpoint {
+        Endpoint::builder(presets::N0)
+            .secret_key(key)
+            .bind()
+            .await
+            .unwrap()
+    }
+
     /// A syntactically valid, distinct endpoint ID per `seed`.
     fn peer(seed: u8) -> EndpointId {
         let key = SecretKey::from_bytes(&[seed; 32]);
@@ -1188,7 +1386,10 @@ mod tests {
         // `fresh` synced a moment ago; `zombie` was last seen 4 days ago.
         store.peer_seen.lock().await.insert(
             zombie,
-            Store::now_ms() - (PEER_TTL.as_millis() as u64) - 1000,
+            PeerSeen {
+                last_seen_ms: Store::now_ms() - (PEER_TTL.as_millis() as u64) - 1000,
+                fail_rounds: 0,
+            },
         );
 
         assert_eq!(store.known_peers().await.unwrap().len(), 3);
@@ -1216,7 +1417,10 @@ mod tests {
         // Age it past the TTL.
         store.peer_seen.lock().await.insert(
             unreachable,
-            Store::now_ms() - (PEER_TTL.as_millis() as u64) - 1000,
+            PeerSeen {
+                last_seen_ms: Store::now_ms() - (PEER_TTL.as_millis() as u64) - 1000,
+                fail_rounds: 0,
+            },
         );
         store.add_peers(&[unreachable]).await.unwrap();
         store.expire_stale_peers(me).await;
@@ -1268,11 +1472,7 @@ mod tests {
         let dir_b = TempDir::new("swarm-b");
         let store_b = Store::open(&dir_b.0).await.unwrap();
         let key_b = load_or_create_secret_key(dir_b.path()).await.unwrap();
-        let ep_b = Endpoint::builder(presets::N0)
-            .secret_key(key_b)
-            .bind()
-            .await
-            .unwrap();
+        let ep_b = build_test_endpoint(key_b).await;
         let router_b = Router::builder(ep_b.clone())
             .accept(ALPN, SyncHandler(store_b.clone()))
             .spawn();
@@ -1280,11 +1480,7 @@ mod tests {
 
         let store_a = Store::open(&dir_a.0).await.unwrap();
         let key_a = load_or_create_secret_key(dir_a.path()).await.unwrap();
-        let ep_a = Endpoint::builder(presets::N0)
-            .secret_key(key_a)
-            .bind()
-            .await
-            .unwrap();
+        let ep_a = build_test_endpoint(key_a).await;
 
         // Give B a record A does not have yet.
         let rid = Uuid::new_v4().to_string();
@@ -1356,11 +1552,7 @@ mod tests {
 
         let dir_peer = TempDir::new("dead-peer");
         let key_peer = load_or_create_secret_key(dir_peer.path()).await.unwrap();
-        let ep_peer = Endpoint::builder(presets::N0)
-            .secret_key(key_peer)
-            .bind()
-            .await
-            .unwrap();
+        let ep_peer = build_test_endpoint(key_peer).await;
         let router_peer = Router::builder(ep_peer.clone())
             .accept(ALPN, HangingHandler)
             .spawn();
@@ -1369,11 +1561,7 @@ mod tests {
         let dir_a = TempDir::new("dead-initiator");
         let store_a = Store::open(&dir_a.0).await.unwrap();
         let key_a = load_or_create_secret_key(dir_a.path()).await.unwrap();
-        let ep_a = Endpoint::builder(presets::N0)
-            .secret_key(key_a)
-            .bind()
-            .await
-            .unwrap();
+        let ep_a = build_test_endpoint(key_a).await;
 
         let target = ep_peer.id();
         // Simulate the residue a previous cut-short exchange leaves behind.
@@ -1431,8 +1619,8 @@ mod tests {
         store.add_peers(&[me, alive, gone]).await.unwrap();
         {
             let mut seen = store.peer_seen.lock().await;
-            let old = Store::now_ms() - (PEER_TTL.as_millis() as u64) - 1000;
-            seen.insert(gone, old);
+            let old_ms = Store::now_ms() - (PEER_TTL.as_millis() as u64) - 1000;
+            seen.insert(gone, PeerSeen { last_seen_ms: old_ms, fail_rounds: 0 });
         }
         store.expire_stale_peers(me).await;
 

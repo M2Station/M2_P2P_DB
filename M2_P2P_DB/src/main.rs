@@ -92,6 +92,21 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 /// of connections at once.
 const MAX_CONCURRENT_SYNCS: usize = 32;
 
+/// Cap on simultaneous *inbound* sync handshakes. The outbound side is
+/// bounded by `MAX_CONCURRENT_SYNCS`; the inbound side has no natural
+/// ceiling and used to let a hostile or buggy peer pile up tokio tasks
+/// (`accept_bi` + every `read_u32` would hang forever, see `HangingHandler`
+/// in the tests). A semaphore keeps the listener responsive regardless of
+/// how many streams a peer attempts.
+const MAX_INBOUND_SYNCS: usize = 32;
+
+/// Upper bound on a single inbound exchange. Inbound has to handle a full
+/// request/reply loop on top of `accept_bi`, so the budget is roughly 2×
+/// `SYNC_TIMEOUT` (which bounds the initiator's one-shot read); without it,
+/// a peer that opens a stream and stops responding holds the inbound
+/// permit indefinitely.
+const INBOUND_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// A peer we have not synced with successfully for this long is dropped from
 /// the peer list (and the removal propagates to the rest of the swarm).
 ///
@@ -169,7 +184,9 @@ enum Command {
         info1: String,
         #[arg(long, default_value = "")]
         info2: String,
-        /// Endpoint ID to stamp as device_id (defaults to "local" unless given).
+        /// Endpoint ID to stamp as `device_id`. Defaults to this node's
+        /// iroh EndpointId (derived from its persistent `secret.key`)
+        /// when omitted.
         #[arg(long)]
         device_id: Option<String>,
         /// Human-readable device name.
@@ -228,7 +245,15 @@ async fn main() -> Result<()> {
         }
         Command::Create { ghname, loginname, cp_aic, info1, info2, device_id, device_name } => {
             let record_id = Uuid::new_v4().to_string();
-            let device_id = device_id.unwrap_or_else(|| "local".to_string());
+            // Stamp `device_id` from this node's persistent secret.key so the
+            // metadata identifies the machine that wrote it. Falling back to
+            // a string like `"local"` would leak an unrecoverable placeholder
+            // into the document: there is no Update flag to repair it, and the
+            // bogus value would propagate to every other node.
+            let device_id = match device_id {
+                Some(id) => id,
+                None => store.local_endpoint_id().await?.to_string(),
+            };
             store
                 .upsert_record(&record_id, &RecordUpsert {
                     ghname, loginname, cp_aic, info1, info2, device_id, device_name,
@@ -301,7 +326,11 @@ async fn main() -> Result<()> {
                     .filter(|id| match seen.get(id) {
                         None => true, // never observed → drop
                         Some(p) => {
-                            p.last_seen_ms != 0 && p.last_seen_ms < cutoff
+                            // R3: TTL is measured from when we first learned
+                            // about the peer, not the last successful sync
+                            // — otherwise a zombie that only ever arrives
+                            // via document propagation never expires.
+                            (p.first_seen_ms != 0 && p.first_seen_ms < cutoff)
                                 || p.fail_rounds >= ZOMBIE_FAIL_ROUNDS
                         }
                     })
@@ -372,7 +401,13 @@ async fn run_listen(store: Store, peers: Vec<EndpointId>) -> Result<()> {
         .address_lookup(PkarrResolver::n0_dns());
     let endpoint = builder.bind().await?;
     let router = Router::builder(endpoint.clone())
-        .accept(ALPN, SyncHandler(store.clone()))
+        .accept(
+            ALPN,
+            SyncHandler {
+                store: store.clone(),
+                inbound_slots: std::sync::Arc::new(std::sync::OnceLock::new()),
+            },
+        )
         .spawn();
 
     endpoint.online().await;
@@ -621,7 +656,19 @@ struct Store {
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, Default)]
 struct PeerSeen {
     /// Unix ms of the last successful sync with this peer.
+    /// `0` means "never synced". Refreshed only by [`Store::mark_peer_seen`].
     last_seen_ms: u64,
+    /// Unix ms of when this peer first entered our peer list. Used for the
+    /// TTL check, so a zombie whose ID keeps propagating through the
+    /// document cannot refresh its expiry by being re-discovered every
+    /// round. Written exactly once by [`Store::seed_peer_baselines`] (or by
+    /// the loader when an older row is read back).
+    ///
+    /// `#[serde(default)]` keeps files written before this field existed
+    /// loadable: the missing field is filled with `0`, which the next
+    /// `seed_peer_baselines` will repair on the next gossip round.
+    #[serde(default)]
+    first_seen_ms: u64,
     /// Consecutive gossip rounds this peer has failed to respond to.
     /// Reset to 0 on every successful sync.
     fail_rounds: u32,
@@ -676,7 +723,7 @@ impl Store {
                     m.into_iter()
                         .filter_map(|(k, v)| {
                             EndpointId::from_str(&k).ok().map(|id| {
-                                (id, PeerSeen { last_seen_ms: v, fail_rounds: 0 })
+                                (id, PeerSeen { last_seen_ms: v, first_seen_ms: v, fail_rounds: 0 })
                             })
                         })
                         .collect()
@@ -729,6 +776,18 @@ impl Store {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
+    }
+
+    /// Derive this node's iroh EndpointId from its persistent `secret.key`,
+    /// so a freshly-created record's `device_id` identifies the machine that
+    /// wrote it without the operator having to look up or paste anything.
+    ///
+    /// Loading the key here (instead of threading the secret key through
+    /// `Command::Create`) keeps CLI subcommands independent of the listening
+    /// endpoint, which only `listen` constructs.
+    async fn local_endpoint_id(&self) -> Result<EndpointId> {
+        let key = load_or_create_secret_key(&self.data_dir).await?;
+        Ok(key.public())
     }
 
     async fn read_record(&self, record_id: &str) -> Result<Option<Record>> {
@@ -849,7 +908,7 @@ impl Store {
             let mut seen = self.peer_seen.lock().await;
             let now = Self::now_ms();
             for peer in newly_seeded {
-                seen.entry(peer).or_insert(PeerSeen { last_seen_ms: now, fail_rounds: 0 });
+                seen.entry(peer).or_insert(PeerSeen { last_seen_ms: 0, first_seen_ms: now, fail_rounds: 0 });
             }
         }
         if changed {
@@ -968,74 +1027,144 @@ impl Store {
 }
 
 /// Protocol handler accepting incoming sync connections.
+///
+/// Wraps a [`Store`] plus a lazily-initialised semaphore so every inbound
+/// exchange is bounded both in count and in wall-clock time (see
+/// [`MAX_INBOUND_SYNCS`] and [`INBOUND_SYNC_TIMEOUT`]). Without these, a
+/// peer that opens a stream and stops responding — or one that floods
+/// us with stream openings — would pin tokio tasks indefinitely.
 #[derive(Debug, Clone)]
-struct SyncHandler(Store);
+struct SyncHandler {
+    store: Store,
+    /// Lazily-initialised semaphore shared across every inbound exchange;
+    /// see [`MAX_INBOUND_SYNCS`].
+    inbound_slots: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>>>,
+}
+
+impl SyncHandler {
+    /// Shared semaphore limiting simultaneous inbound exchanges to
+    /// [`MAX_INBOUND_SYNCS`]. Initialised lazily so the first `clone()`
+    /// does not pay for it until a connection actually arrives.
+    fn slots(&self) -> std::sync::Arc<tokio::sync::Semaphore> {
+        self.inbound_slots
+            .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_SYNCS)))
+            .clone()
+    }
+}
 
 impl ProtocolHandler for SyncHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let peer = connection.remote_id();
-        let (mut send, mut recv) = connection
-            .accept_bi()
-            .await
-            .map_err(|e| AcceptError::from_err(e))?;
+        // Cap inbound handshakes before we even accept the bi-stream: a
+        // peer that keeps opening streams can otherwise pile up tokio
+        // tasks whose first `await` is a hang on `accept_bi` itself. If
+        // the slot pool is full, close the connection promptly so the
+        // peer has a chance to back off (and we do not silently accept).
+        let permit = match self.slots().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                // `warn` rather than `debug`: the default `EnvFilter` is
+                // `warn`, so a sustained flood of rejections would be
+                // invisible at the lower level. Legitimate, infrequent
+                // rejections are still rare enough not to spam logs.
+                tracing::warn!(
+                    "rejecting inbound from {peer}: at most {MAX_INBOUND_SYNCS} \
+                     inbound syncs in flight"
+                );
+                connection.close(0u32.into(), b"too many inbound syncs");
+                return Ok(());
+            }
+        };
 
-        let store = self.0.clone();
+        let (mut send, mut recv) = match connection.accept_bi().await {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(AcceptError::from_err(e));
+            }
+        };
+
+        let store = self.store.clone();
         // The initiator drives; we just respond. Mirror their framing.
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            // Start every connection's exchange from a clean sync state. A
-            // previous exchange that ended without the peer's reply (dropped
-            // connection, our own read failure) leaves `in_flight` set, which
-            // would make every `generate_sync_message` below return `None` and
-            // leave us mute to this peer forever. See `reset_sync_state`.
-            store.reset_sync_state(peer).await;
-            let res: Result<()> = loop {
-                // Pick up any changes written to disk by other processes.
-                if let Err(e) = store.refresh().await {
-                    break Err(e);
-                }
-                // Read one incoming message (0 = peer done).
-                let len = match recv.read_u32().await {
-                    Ok(0) | Err(_) => break Ok(()),
-                    Ok(len) => len,
-                };
-                let mut buf = vec![0u8; len as usize];
-                if recv.read_exact(&mut buf).await.is_err() {
-                    break Ok(());
-                }
-                let Ok(message) = sync::Message::decode(&buf) else {
-                    break Ok(());
-                };
-                {
-                    let mut inner = store.inner.lock().await;
-                    let StoreInner { doc, sync_states, .. } = &mut *inner;
-                    let state = sync_states.entry(peer).or_insert_with(sync::State::new);
-                    if let Err(e) = doc.sync().receive_sync_message(state, message) {
-                        break Err(n0_error::AnyError::from_display(e));
+            // Hold `permit` until the task ends so a slow peer cannot exhaust
+            // the pool by spawning tasks faster than they complete.
+            let _permit = permit;
+
+            // Bound the whole exchange: without this, a peer that opens
+            // the stream and then stops responding would hold its inbound
+            // slot forever (matching the `HangingHandler` test scenario).
+            let res: Result<()> = match tokio::time::timeout(INBOUND_SYNC_TIMEOUT, async {
+                // Start every connection's exchange from a clean sync state.
+                // A previous exchange that ended without the peer's reply
+                // (dropped connection, our own read failure) leaves
+                // `in_flight` set, which would make every
+                // `generate_sync_message` below return `None` and leave us
+                // mute to this peer forever. See `reset_sync_state`.
+                store.reset_sync_state(peer).await;
+                loop {
+                    // Pick up any changes written to disk by other processes.
+                    if let Err(e) = store.refresh().await {
+                        break Err(e);
                     }
-                }
-                // Reply with our next message, if any.
-                let outgoing = {
-                    let mut inner = store.inner.lock().await;
-                    let StoreInner { doc, sync_states, .. } = &mut *inner;
-                    let state = sync_states.entry(peer).or_insert_with(sync::State::new);
-                    doc.sync().generate_sync_message(state)
-                };
-                match outgoing {
-                    Some(message) => {
-                        let bytes = message.encode();
-                        if send.write_u32(bytes.len() as u32).await.is_err() {
-                            break Ok(());
-                        }
-                        if send.write_all(&bytes).await.is_err() {
-                            break Ok(());
-                        }
-                    }
-                    None => {
-                        let _ = send.write_u32(0).await;
-                        let _ = send.shutdown().await;
+                    // Read one incoming message (0 = peer done). The
+                    // outer `tokio::time::timeout` above bounds the whole
+                    // exchange — including this read — so no per-read
+                    // timeout is needed here; a stalled read will simply
+                    // trip the outer timer.
+                    let len = match recv.read_u32().await {
+                        Ok(0) | Err(_) => break Ok(()),
+                        Ok(len) => len,
+                    };
+                    let mut buf = vec![0u8; len as usize];
+                    if recv.read_exact(&mut buf).await.is_err() {
                         break Ok(());
                     }
+                    let Ok(message) = sync::Message::decode(&buf) else {
+                        break Ok(());
+                    };
+                    {
+                        let mut inner = store.inner.lock().await;
+                        let StoreInner { doc, sync_states, .. } = &mut *inner;
+                        let state = sync_states.entry(peer).or_insert_with(sync::State::new);
+                        if let Err(e) = doc.sync().receive_sync_message(state, message) {
+                            break Err(n0_error::AnyError::from_display(e));
+                        }
+                    }
+                    // Reply with our next message, if any.
+                    let outgoing = {
+                        let mut inner = store.inner.lock().await;
+                        let StoreInner { doc, sync_states, .. } = &mut *inner;
+                        let state = sync_states.entry(peer).or_insert_with(sync::State::new);
+                        doc.sync().generate_sync_message(state)
+                    };
+                    match outgoing {
+                        Some(message) => {
+                            let bytes = message.encode();
+                            if send.write_u32(bytes.len() as u32).await.is_err() {
+                                break Ok(());
+                            }
+                            if send.write_all(&bytes).await.is_err() {
+                                break Ok(());
+                            }
+                        }
+                        None => {
+                            let _ = send.write_u32(0).await;
+                            let _ = send.shutdown().await;
+                            break Ok(());
+                        }
+                    }
+                }
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::debug!(
+                        "inbound sync with {peer} timed out after {}s",
+                        INBOUND_SYNC_TIMEOUT.as_secs()
+                    );
+                    Ok(())
                 }
             };
             if let Err(e) = res {
@@ -1108,38 +1237,67 @@ impl Store {
         self.persist(&mut doc).await
     }
 
-    /// Record that we just synced successfully with `peer`. Local only — this
-    /// timestamp is what the 1-day expiry is measured against. Clears the
-    /// fail-round counter so a flaky peer does not get dropped mid-recovery.
+    /// Record that we just synced successfully with `peer`. Local only —
+    /// this is the *only* writer of `last_seen_ms`. Clears the fail-round
+    /// counter so a flaky peer does not get dropped mid-recovery.
+    /// `first_seen_ms` is preserved if we already had a row; for a peer we
+    /// are seeing for the very first time (e.g. an inbound from a brand new
+    /// node) it is seeded with the same value as `last_seen_ms`, so the TTL
+    /// clock starts counting from the moment we first observed it.
     async fn mark_peer_seen(&self, peer: EndpointId) {
         let mut seen = self.peer_seen.lock().await;
-        seen.insert(
-            peer,
-            PeerSeen { last_seen_ms: Self::now_ms(), fail_rounds: 0 },
-        );
+        let now = Self::now_ms();
+        seen.entry(peer)
+            .and_modify(|p| {
+                if p.first_seen_ms == 0 {
+                    p.first_seen_ms = now;
+                }
+                p.last_seen_ms = now;
+                p.fail_rounds = 0;
+            })
+            .or_insert(PeerSeen {
+                last_seen_ms: now,
+                first_seen_ms: now,
+                fail_rounds: 0,
+            });
     }
 
     /// Start the expiry clock for peers we are about to dial but have no
-    /// last-seen for. Peers arrive mostly by syncing the document (their
+    /// row for. Peers arrive mostly by syncing the document (their
     /// `peer:` keys propagate), which does not go through `add_peers`, so
     /// without this they would have no baseline and never expire.
+    ///
+    /// Only `first_seen_ms` is touched: this is the R3 fix. Setting
+    /// `last_seen_ms = now` here would let a zombie whose ID keeps
+    /// propagating through the document refresh its TTL on every gossip
+    /// round and effectively never get dropped.
     async fn seed_peer_baselines(&self, peers: &[EndpointId]) {
         let mut seen = self.peer_seen.lock().await;
         let now = Self::now_ms();
         for peer in peers {
-            seen.entry(*peer).or_insert(PeerSeen { last_seen_ms: now, fail_rounds: 0 });
+            seen.entry(*peer).or_insert(PeerSeen {
+                last_seen_ms: 0,
+                first_seen_ms: now,
+                fail_rounds: 0,
+            });
         }
     }
 
     /// Record that a gossip round failed to reach `peer`. Cumulative — the
     /// counter is reset on every successful sync by [`mark_peer_seen`].
     /// Bumping is best-effort: if the peer has no row yet, seed it with
-    /// 1 fail round so it has a baseline to count from.
+    /// `first_seen_ms = now` (the same as a baseline) and `fail_rounds = 1`,
+    /// so the proactive zombie cleanup has something to count from.
     async fn bump_peer_fail(&self, peer: EndpointId) {
         let mut seen = self.peer_seen.lock().await;
+        let now = Self::now_ms();
         seen.entry(peer)
             .and_modify(|p| p.fail_rounds = p.fail_rounds.saturating_add(1))
-            .or_insert(PeerSeen { last_seen_ms: Self::now_ms(), fail_rounds: 1 });
+            .or_insert(PeerSeen {
+                last_seen_ms: 0,
+                first_seen_ms: now,
+                fail_rounds: 1,
+            });
     }
 
     /// Persist the last-seen table to disk so the expiry baseline survives a
@@ -1208,7 +1366,12 @@ impl Store {
                     if *id == self_id {
                         return None;
                     }
-                    let ttl_expired = p.last_seen_ms != 0 && p.last_seen_ms < cutoff;
+                    // R3: TTL is measured from `first_seen_ms`, not
+                    // `last_seen_ms`. A peer that only ever reaches us via
+                    // document propagation would otherwise keep refreshing
+                    // `last_seen_ms` indirectly (via the seed path) and
+                    // never expire.
+                    let ttl_expired = p.first_seen_ms != 0 && p.first_seen_ms < cutoff;
                     let zombie = p.fail_rounds >= ZOMBIE_FAIL_ROUNDS;
                     if ttl_expired || zombie { Some(*id) } else { None }
                 })
@@ -1216,8 +1379,10 @@ impl Store {
         };
 
         // Cap the peer list. If we accumulated more than MAX_PEERS, evict
-        // the entries with the oldest last-seen (the ones least worth keeping).
-        // Self is always kept.
+        // the entries that have been quiet longest (smallest `last_seen_ms`).
+        // Self is always kept. Peers we have never synced with carry
+        // `last_seen_ms == 0`, so they sort to the front of the eviction
+        // order — the intended behaviour for zombies.
         {
             let seen = self.peer_seen.lock().await;
             if seen.len() > MAX_PEERS {
@@ -1336,6 +1501,18 @@ mod tests {
         }
     }
 
+    /// Build a `PeerSeen` whose `first_seen_ms` sits `ttl_ago` in the past
+    /// and which has never successfully synced. Used by the TTL tests to
+    /// age a peer out without having to thread `Store::now_ms` arithmetic
+    /// into each fixture.
+    fn aged_peer_seen(ttl_ago: Duration) -> PeerSeen {
+        PeerSeen {
+            last_seen_ms: 0,
+            first_seen_ms: Store::now_ms().saturating_sub(ttl_ago.as_millis() as u64),
+            fail_rounds: 0,
+        }
+    }
+
     /// Build a sync-only endpoint for tests.
     ///
     /// Tests don't need the production hardening (no DnsAddressLookup, no
@@ -1388,13 +1565,11 @@ mod tests {
         let zombie = peer(3);
 
         store.add_peers(&[me, fresh, zombie]).await.unwrap();
-        // `fresh` synced a moment ago; `zombie` was last seen 4 days ago.
+        // `fresh` was just added; `zombie` first appeared 4 days ago and
+        // never successfully synced.
         store.peer_seen.lock().await.insert(
             zombie,
-            PeerSeen {
-                last_seen_ms: Store::now_ms() - (PEER_TTL.as_millis() as u64) - 1000,
-                fail_rounds: 0,
-            },
+            aged_peer_seen(PEER_TTL + Duration::from_secs(1)),
         );
 
         assert_eq!(store.known_peers().await.unwrap().len(), 3);
@@ -1422,14 +1597,78 @@ mod tests {
         // Age it past the TTL.
         store.peer_seen.lock().await.insert(
             unreachable,
-            PeerSeen {
-                last_seen_ms: Store::now_ms() - (PEER_TTL.as_millis() as u64) - 1000,
-                fail_rounds: 0,
-            },
+            aged_peer_seen(PEER_TTL + Duration::from_secs(1)),
         );
         store.add_peers(&[unreachable]).await.unwrap();
         store.expire_stale_peers(me).await;
         assert!(!store.known_peers().await.unwrap().contains(&unreachable));
+    }
+
+    #[tokio::test]
+    async fn seed_peer_baselines_does_not_refresh_first_seen() {
+        // R3 regression guard. The old implementation set
+        // `last_seen_ms = now` in `seed_peer_baselines`, which the TTL
+        // check later consulted — so a peer whose ID kept arriving via
+        // document sync could have its expiry refreshed every round and
+        // effectively never be dropped. After R3, `first_seen_ms` is the
+        // anchor for the TTL, and seeding only sets it once.
+        let dir = TempDir::new("seed-no-refresh");
+        let store = Store::open(&dir.0).await.unwrap();
+        let me = peer(1);
+        let zombie = peer(5);
+
+        // 1) Seed baseline → `first_seen_ms` is set.
+        store.seed_peer_baselines(&[zombie]).await;
+        let seeded_first = store.peer_seen.lock().await.get(&zombie).unwrap().first_seen_ms;
+        assert_ne!(seeded_first, 0, "seed must record first_seen_ms");
+
+        // 2) Re-seed many times (simulating a zombie whose ID keeps
+        //    arriving via document sync each round). `first_seen_ms`
+        //    must not move forward.
+        for _ in 0..32 {
+            store.seed_peer_baselines(&[zombie]).await;
+        }
+        let after_first = store.peer_seen.lock().await.get(&zombie).unwrap().first_seen_ms;
+        assert_eq!(
+            after_first, seeded_first,
+            "seed_peer_baselines must not refresh first_seen_ms, \
+             or a document-propagated zombie would never expire"
+        );
+
+        // 3) Age the row past the TTL (simulating >24h without a real sync).
+        store.peer_seen.lock().await.insert(
+            zombie,
+            aged_peer_seen(PEER_TTL + Duration::from_secs(1)),
+        );
+
+        // 4) One more seed must not "rescue" it: `first_seen_ms` stays in
+        //    the past, and expiry proceeds normally.
+        store.seed_peer_baselines(&[zombie]).await;
+        store.add_peers(&[zombie]).await.unwrap();
+        store.expire_stale_peers(me).await;
+        assert!(
+            !store.known_peers().await.unwrap().contains(&zombie),
+            "an aged zombie must still be dropped even after re-seeding"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_endpoint_id_is_stable_and_never_local() {
+        // The CLI used to fall back to the literal string `"local"` when no
+        // `--device-id` was passed. That placeholder propagated to every
+        // peer and could never be repaired (no Update flag exposed it).
+        // Stamping the persistent EndpointId instead keeps the metadata
+        // meaningful and the document clean.
+        let dir = TempDir::new("local-id");
+        let store = Store::open(&dir.0).await.unwrap();
+        let first = store.local_endpoint_id().await.unwrap();
+        let second = store.local_endpoint_id().await.unwrap();
+        assert_eq!(first, second, "EndpointId must be stable across calls");
+        assert_ne!(
+            first.to_string(),
+            "local",
+            "the 'local' placeholder must never be used as a device_id"
+        );
     }
 
     #[tokio::test]
@@ -1479,7 +1718,13 @@ mod tests {
         let key_b = load_or_create_secret_key(dir_b.path()).await.unwrap();
         let ep_b = build_test_endpoint(key_b).await;
         let router_b = Router::builder(ep_b.clone())
-            .accept(ALPN, SyncHandler(store_b.clone()))
+            .accept(
+                ALPN,
+                SyncHandler {
+                    store: store_b.clone(),
+                    inbound_slots: std::sync::Arc::new(std::sync::OnceLock::new()),
+                },
+            )
             .spawn();
         ep_b.online().await;
 
@@ -1625,7 +1870,11 @@ mod tests {
         {
             let mut seen = store.peer_seen.lock().await;
             let old_ms = Store::now_ms() - (PEER_TTL.as_millis() as u64) - 1000;
-            seen.insert(gone, PeerSeen { last_seen_ms: old_ms, fail_rounds: 0 });
+            seen.insert(gone, PeerSeen {
+                last_seen_ms: 0,
+                first_seen_ms: old_ms,
+                fail_rounds: 0,
+            });
         }
         store.expire_stale_peers(me).await;
 

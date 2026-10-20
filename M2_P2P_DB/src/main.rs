@@ -215,6 +215,11 @@ enum Command {
     Delete { record_id: Uuid },
     /// List all records as JSON.
     List,
+    /// Print this node's iroh EndpointId (and the data dir / secret.key it
+    /// was derived from) without starting a listener. Useful for sharing
+    /// the id with `--peers` and for diagnosing why two installs report
+    /// different identities.
+    Id,
     /// Drop zombie peers: anything in the document under `peer:` that has
     /// either no last-seen entry or whose fail-round counter is at the cap.
     /// Run with the node offline (no listener) so it doesn't fight an
@@ -298,6 +303,34 @@ async fn main() -> Result<()> {
         Command::List => {
             for rec in store.list_records().await? {
                 println!("{rec}");
+            }
+            Ok(())
+        }
+        Command::Id => {
+            // Print the EndpointId without binding an iroh endpoint, so this
+            // is safe to run while another listener is already up. Useful for
+            // diagnosing "two installs report different ids" — the data dir
+            // line below makes it obvious which `secret.key` was consulted.
+            let id = store.local_endpoint_id().await?;
+            let key_path = store.data_dir.join(KEY_FILE);
+            let key_meta = tokio::fs::metadata(&key_path).await;
+            let (key_status, key_bytes) = match &key_meta {
+                Ok(m) => (
+                    "present".to_string(),
+                    Some(m.len()),
+                ),
+                Err(_) => ("missing — this id was generated in-memory; \
+                            next run will mint a fresh one unless a key is \
+                            created first"
+                            .to_string(), None),
+            };
+            println!("node endpoint id: {id}");
+            println!("data dir:          {}", store.data_dir.display());
+            println!("secret.key:        {}", key_path.display());
+            if let Some(n) = key_bytes {
+                println!("                   {key_status} ({n} bytes)");
+            } else {
+                println!("                   {key_status}");
             }
             Ok(())
         }

@@ -10,6 +10,8 @@ Each record has exactly these fields (stored under `record:<uuid>` in the Autome
 {
   "record_id": "1eea15db-86e4-43b9-b732-84eb222ff659",
   "updated_at": "2026-10-15T02:28:30+00:00",
+  "m2_apex_ver": "2026.10.1",
+  "cp_acc": "open_source",
   "ghname": "oahsiao",
   "loginname": "v-oahsiao",
   "cp_aic": 87226,
@@ -20,9 +22,9 @@ Each record has exactly these fields (stored under `record:<uuid>` in the Autome
 }
 ```
 
-`record_id` is a fresh UUID at creation; `updated_at` is an ISO 8601 timestamp stamped on every write. `ghname` is the display name, `loginname` the account name. `device_id` marks the owning node's endpoint ID (defaults to `"local"`); `device_name` is a human-readable device name. The local UTC offset defaults to `+00:00`; set `M2_TZ_OFFSET_MINUTES=480` (for UTC+8) on the node's environment to emit local-offset timestamps.
+`record_id` is a fresh UUID at creation; `updated_at` is an ISO 8601 timestamp stamped on every write. `m2_apex_ver` is the M2 Apex version the user was running. `cp_acc` records the kind of Copilot account — `feature_flag` (Microsoft GitHub Copilot feature flag), `open_source`, or `emu` (EMU / `v-` account) — and is stored as a free-form string, so a new kind needs no code change. `ghname` is the display name, `loginname` the account name. `device_id` marks the owning node's endpoint ID (defaults to `"local"`); `device_name` is a human-readable device name. The local UTC offset defaults to `+00:00`; set `M2_TZ_OFFSET_MINUTES=480` (for UTC+8) on the node's environment to emit local-offset timestamps.
 
-> Schema note: the earlier `username` field was replaced by `ghname` + `loginname`, and `device_name` was added. Existing `doc.automerge` files written by older builds keep the old field names — new records read them as empty strings. Delete the data dir to start fresh.
+> Schema note: the earlier `username` field was replaced by `ghname` + `loginname`, and `device_name` was added. More recently `m2_apex_ver` + `cp_acc` were added right after `updated_at`. Existing `doc.automerge` files written by older builds keep the old field names — new records read them as empty strings. Delete the data dir to start fresh.
 
 ## Build
 
@@ -51,9 +53,9 @@ cargo run -p M2_P2P_DB -- --data-dir nodeB listen
 Terminal 3 — CRUD:
 
 ```bash
-cargo run -p M2_P2P_DB -- --data-dir nodeA create --ghname oahsiao --loginname v-oahsiao --cp-aic 87226 --info1 xx --info2 yy --device-name MY-PC
+cargo run -p M2_P2P_DB -- --data-dir nodeA create --ghname oahsiao --loginname v-oahsiao --cp-aic 87226 --info1 xx --info2 yy --device-name MY-PC --m2-apex-ver 2026.10.1 --cp-acc open_source
 cargo run -p M2_P2P_DB -- --data-dir nodeA read <record-id>
-cargo run -p M2_P2P_DB -- --data-dir nodeA update <record-id> --cp-aic 90000 --device-name NEW-PC
+cargo run -p M2_P2P_DB -- --data-dir nodeA update <record-id> --cp-aic 90000 --device-name NEW-PC --cp-acc emu
 cargo run -p M2_P2P_DB -- --data-dir nodeA delete <record-id>
 cargo run -p M2_P2P_DB -- --data-dir nodeA list
 ```
@@ -80,3 +82,4 @@ A new node on the LAN therefore converges with the whole swarm with zero manual 
 - **Peer last-seen times live in `peers.lastseen.json`, not in the document.** They change every gossip round, and every document write is a permanent Automerge op, so storing them there would grow the document without bound. The file is local to each node; only the *removal* of an expired peer is a document change, which propagates normally. A peer with no last-seen entry is given one the moment we learn about it (from mDNS, a seed, or the synced document), so a node we never reach still expires 3 days after we first heard of it rather than lingering forever.
 - Concurrent syncs serialise their saves: `persist_snapshot`'s read-merge-write runs under a dedicated lock, and each save writes a uniquely named temp file before the atomic rename. Without both, two syncs finishing at once could clobber each other's save.
 - Each round clears the peer's `sync::State::in_flight` **before** dialling. Automerge sets that flag when generating a message and clears it only when a reply arrives; any exchange that ends another way (peer closed first, I/O error, our own timeout) leaves it set, and `generate_sync_message` then returns `None` forever — the peer goes silently mute. Clearing it at the start of a round rather than after a failure matters because a timeout *drops the sync future mid-await*, so any cleanup written after that `.await` never runs.
+- **Schema changes are additive and merge-safe, so old and new builds can run in the same swarm.** A record is a flat map and every write is a per-key op, so a peer on an older build simply ignores keys it does not know, and its `update` cannot erase them: `upsert_record` only puts the fields it knows, and nothing in the read path consults a field list. New fields therefore propagate and survive an old peer's writes, while a record written by an old build reads the new keys as empty strings. What is *not* possible is the reverse — an old build cannot set or display the new fields. Anything outside this crate that treats the field set as fixed (a strict JSON schema, a fixed-column importer) has to be updated alongside. Covered by `merges_with_data_written_by_an_older_build`.

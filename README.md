@@ -12,6 +12,8 @@ A P2P distributed data store built on **iroh** (QUIC, NAT traversal, no central 
 {
   "record_id": "1eea15db-86e4-43b9-b732-84eb222ff659",
   "updated_at": "2026-10-15T02:28:30+00:00",
+  "m2_apex_ver": "2026.10.1",
+  "cp_acc": "open_source",
   "ghname": "oahsiao",
   "loginname": "v-oahsiao",
   "cp_aic": 87226,
@@ -24,12 +26,14 @@ A P2P distributed data store built on **iroh** (QUIC, NAT traversal, no central 
 
 - `record_id` — 建立時自動產生的 UUID v4
 - `updated_at` — ISO 8601 時間戳，每次寫入自動更新。預設 UTC (`+00:00`)；在節點環境設 `M2_TZ_OFFSET_MINUTES=480` 即輸出 `+08:00` 這類本機時區偏移
+- `m2_apex_ver` — 當下使用者的 M2 Apex 版本（字串，如 `2026.10.1`）
+- `cp_acc` — Copilot 帳號種類（字串）：`feature_flag`＝Microsoft GitHub Copilot feature flag、`open_source`＝Open Source、`emu`＝EMU 帳號（`v-` account）。原樣儲存、不做驗證，之後新增種類不需改程式
 - `ghname` — 顯示名（GitHub 風格，如 `oahsiao`）
 - `loginname` — 帳號名（如 `v-oahsiao`）
 - `device_id` — 可選，預設 `"local"`，通常放 iroh endpoint ID 標記資料來源
 - `device_name` — 人類可讀的裝置名（如 `MY-PC`）
 
-> Schema 變更提醒：舊版的 `username` 已由 `ghname` + `loginname` 取代，並新增 `device_name`。舊版程式寫出的 `doc.automerge` 仍保留舊欄位名，新程式讀取時對應欄位為空字串；請刪除舊 data-dir 重新開始。
+> Schema 變更提醒：舊版的 `username` 已由 `ghname` + `loginname` 取代，並新增 `device_name`；其後再新增 `m2_apex_ver` + `cp_acc`（緊接在 `updated_at` 之後）。舊版程式寫出的 `doc.automerge` 仍保留舊欄位名，新程式讀取時對應欄位為空字串；請刪除舊 data-dir 重新開始。
 
 ## 架構
 
@@ -86,17 +90,17 @@ mdns discovery: enabled (LAN peers are discovered automatically)
 
 ```bash
 # 新增（record_id 自動產生 UUID，updated_at 自動蓋時間）
-.\target\debug\M2_P2P_DB.exe --data-dir nodeA create --ghname oahsiao --loginname v-oahsiao --cp-aic 87226 --info1 xx --info2 yy --device-name MY-PC
+.\target\debug\M2_P2P_DB.exe --data-dir nodeA create --ghname oahsiao --loginname v-oahsiao --cp-aic 87226 --info1 xx --info2 yy --device-name MY-PC --m2-apex-ver 2026.10.1 --cp-acc open_source
 
 # 輸出：
 # created 1eea15db-86e4-43b9-b732-84eb222ff659
-# { "record_id": "1eea15db-...", "updated_at": "...", "ghname": "oahsiao", "loginname": "v-oahsiao", ... }
+# { "record_id": "1eea15db-...", "updated_at": "...", "m2_apex_ver": "2026.10.1", "cp_acc": "open_source", ... }
 
 # 讀取（用上面記下的 UUID）
 .\target\debug\M2_P2P_DB.exe --data-dir nodeA read 1eea15db-86e4-43b9-b732-84eb222ff659
 
 # 更新（只給要改的欄位，updated_at 自動重蓋）
-.\target\debug\M2_P2P_DB.exe --data-dir nodeA update 1eea15db-86e4-43b9-b732-84eb222ff659 --cp-aic 90000 --device-name NEW-PC
+.\target\debug\M2_P2P_DB.exe --data-dir nodeA update 1eea15db-86e4-43b9-b732-84eb222ff659 --cp-aic 90000 --device-name NEW-PC --cp-acc emu
 
 # 刪除
 .\target\debug\M2_P2P_DB.exe --data-dir nodeA delete 1eea15db-86e4-43b9-b732-84eb222ff659
@@ -144,6 +148,7 @@ iroh 本體、其他 workspace 成員與範例皆未改動。
 ## 已知限制
 
 - **同欄位並發寫入採 LWW**：兩節點同時改同一筆紀錄的 `cp_aic`，時間戳新的贏；不同欄位、不同紀錄的並發寫入則完全無衝突合併
+- **Schema 相容性（新舊版本混跑）**：新增欄位是加法且合併安全的。紀錄是扁平 map、每次寫入都是 per-key op，所以舊版 binary 讀到不認識的鍵只會忽略（不報錯），舊版 `update` 也不會刪掉它們（只 put 自己知道的欄位）——新欄位能存活並繼續傳播；反之新程式讀舊資料時，新欄位為空字串。唯一做不到的方向是「舊版設定或顯示新欄位」。要一起更新的是本 crate 之外、把欄位集合視為固定的消費者（嚴格 JSON schema、固定欄位的匯入腳本等）。已由 `merges_with_data_written_by_an_older_build` 測試守住
 - **gossip 間隔固定 30 秒**（`src/main.rs` 中 `Duration::from_secs(30)`）
 - mDNS 失敗（防火牆/VPN 限制）會自動降級為手動 connect，功能不受影響
 - 同步狀態存在記憶體（每 peer 一個 `sync::State`），20 節點規模沒有問題

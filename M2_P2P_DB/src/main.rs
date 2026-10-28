@@ -6,6 +6,8 @@
 //! {
 //!   "record_id": "UUID",
 //!   "updated_at": "2026-10-14T15:00:00+08:00",
+//!   "m2_apex_ver": "2026.10.1",
+//!   "cp_acc": "open_source",
 //!   "ghname": "oahsiao",
 //!   "loginname": "v-oahsiao",
 //!   "cp_aic": 87226,
@@ -25,9 +27,9 @@
 //!
 //!     M2_P2P_DB listen
 //!     M2_P2P_DB connect <endpoint-id>
-//!     M2_P2P_DB create --ghname oahsiao --loginname v-oahsiao --cp-aic 87226 --info1 xx --info2 xx
+//!     M2_P2P_DB create --ghname oahsiao --loginname v-oahsiao --cp-aic 87226 --info1 xx --info2 xx --m2-apex-ver 2026.10.1 --cp-acc open_source
 //!     M2_P2P_DB read <record-id>
-//!     M2_P2P_DB update <record-id> --cp-aic 90000
+//!     M2_P2P_DB update <record-id> --cp-aic 90000 --cp-acc emu
 //!     M2_P2P_DB delete <record-id>
 //!     M2_P2P_DB list
 
@@ -178,6 +180,15 @@ enum Command {
         /// Login/account name.
         #[arg(long)]
         loginname: String,
+        /// M2 Apex version the user is currently running, e.g. `2026.10.1`.
+        #[arg(long, default_value = "")]
+        m2_apex_ver: String,
+        /// Kind of Copilot account behind this record. Stored verbatim: the
+        /// known kinds are `feature_flag` (Microsoft GitHub Copilot feature
+        /// flag), `open_source`, and `emu` (EMU / `v-` account), but any
+        /// string is accepted so a new kind needs no code change.
+        #[arg(long, default_value = "")]
+        cp_acc: String,
         #[arg(long)]
         cp_aic: f64,
         #[arg(long, default_value = "")]
@@ -202,6 +213,10 @@ enum Command {
         ghname: Option<String>,
         #[arg(long)]
         loginname: Option<String>,
+        #[arg(long)]
+        m2_apex_ver: Option<String>,
+        #[arg(long)]
+        cp_acc: Option<String>,
         #[arg(long)]
         cp_aic: Option<f64>,
         #[arg(long)]
@@ -248,7 +263,7 @@ async fn main() -> Result<()> {
             println!("sync with {endpoint_id} complete");
             Ok(())
         }
-        Command::Create { ghname, loginname, cp_aic, info1, info2, device_id, device_name } => {
+        Command::Create { ghname, loginname, m2_apex_ver, cp_acc, cp_aic, info1, info2, device_id, device_name } => {
             let record_id = Uuid::new_v4().to_string();
             // Stamp `device_id` from this node's persistent secret.key so the
             // metadata identifies the machine that wrote it. Falling back to
@@ -261,7 +276,7 @@ async fn main() -> Result<()> {
             };
             store
                 .upsert_record(&record_id, &RecordUpsert {
-                    ghname, loginname, cp_aic, info1, info2, device_id, device_name,
+                    m2_apex_ver, cp_acc, ghname, loginname, cp_aic, info1, info2, device_id, device_name,
                 })
                 .await?;
             println!("created {record_id}");
@@ -276,12 +291,14 @@ async fn main() -> Result<()> {
             print_record(&store, &record_id.to_string()).await;
             Ok(())
         }
-        Command::Update { record_id, ghname, loginname, cp_aic, info1, info2, device_name } => {
+        Command::Update { record_id, ghname, loginname, m2_apex_ver, cp_acc, cp_aic, info1, info2, device_name } => {
             let Some(current) = store.read_record(&record_id.to_string()).await? else {
                 eprintln!("record '{record_id}' not found");
                 std::process::exit(1);
             };
             let upsert = RecordUpsert {
+                m2_apex_ver: m2_apex_ver.unwrap_or(current.m2_apex_ver),
+                cp_acc: cp_acc.unwrap_or(current.cp_acc),
                 ghname: ghname.unwrap_or(current.ghname),
                 loginname: loginname.unwrap_or(current.loginname),
                 cp_aic: cp_aic.unwrap_or(current.cp_aic),
@@ -615,6 +632,15 @@ struct Record {
     record_id: String,
     /// ISO 8601 timestamp with local offset, e.g. `2026-10-14T15:00:00+08:00`.
     updated_at: String,
+    /// M2 Apex version the user was running at the time of this write,
+    /// e.g. `2026.10.1`. Free-form string: version schemes change, and a
+    /// record must never fail to store because of one.
+    m2_apex_ver: String,
+    /// Kind of Copilot account behind this record. The currently known kinds
+    /// are `feature_flag` (Microsoft GitHub Copilot feature flag),
+    /// `open_source`, and `emu` (EMU / `v-` account). Deliberately not an
+    /// enum: a new account kind must be storable without a code change.
+    cp_acc: String,
     /// GitHub-style display name.
     ghname: String,
     /// Login/account name.
@@ -631,6 +657,10 @@ struct Record {
 /// `updated_at`, which are managed: UUID at creation, timestamp on write).
 #[derive(Debug, Clone)]
 struct RecordUpsert {
+    /// M2 Apex version the user was running; see [`Record::m2_apex_ver`].
+    m2_apex_ver: String,
+    /// Kind of Copilot account; see [`Record::cp_acc`].
+    cp_acc: String,
     ghname: String,
     loginname: String,
     cp_aic: f64,
@@ -644,9 +674,11 @@ impl std::fmt::Display for Record {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ \"record_id\": {:?}, \"updated_at\": {:?}, \"ghname\": {:?}, \"loginname\": {:?}, \
+            "{{ \"record_id\": {:?}, \"updated_at\": {:?}, \"m2_apex_ver\": {:?}, \"cp_acc\": {:?}, \
+             \"ghname\": {:?}, \"loginname\": {:?}, \
              \"cp_aic\": {}, \"device_id\": {:?}, \"device_name\": {:?}, \"info1\": {:?}, \"info2\": {:?} }}",
-            self.record_id, self.updated_at, self.ghname, self.loginname,
+            self.record_id, self.updated_at, self.m2_apex_ver, self.cp_acc,
+            self.ghname, self.loginname,
             self.cp_aic, self.device_id, self.device_name, self.info1, self.info2
         )
     }
@@ -848,6 +880,8 @@ impl Store {
         Ok(Some(Record {
             record_id: record_id.to_string(),
             updated_at: get_str("updated_at")?,
+            m2_apex_ver: get_str("m2_apex_ver")?,
+            cp_acc: get_str("cp_acc")?,
             ghname: get_str("ghname")?,
             loginname: get_str("loginname")?,
             cp_aic,
@@ -870,6 +904,8 @@ impl Store {
                 .doc
                 .put(&rec, "updated_at", Self::now_iso8601())
                 .anyerr()?;
+            inner.doc.put(&rec, "m2_apex_ver", &fields.m2_apex_ver).anyerr()?;
+            inner.doc.put(&rec, "cp_acc", &fields.cp_acc).anyerr()?;
             inner.doc.put(&rec, "ghname", &fields.ghname).anyerr()?;
             inner.doc.put(&rec, "loginname", &fields.loginname).anyerr()?;
             inner.doc.put(&rec, "cp_aic", fields.cp_aic).anyerr()?;
@@ -1705,6 +1741,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apex_ver_and_cp_acc_round_trip_after_updated_at() {
+        // The two newest fields are plain strings, live right after
+        // `updated_at`, and behave like every other field: persisted, and
+        // readable as empty strings from records an older build wrote.
+        let dir = TempDir::new("apex-cpacc");
+        let store = Store::open(&dir.0).await.unwrap();
+        let rid = Uuid::new_v4().to_string();
+        store
+            .upsert_record(
+                &rid,
+                &RecordUpsert {
+                    m2_apex_ver: "2026.10.1".into(),
+                    cp_acc: "open_source".into(),
+                    ghname: "oahsiao".into(),
+                    loginname: "v-oahsiao".into(),
+                    cp_aic: 87226.0,
+                    device_id: "local".into(),
+                    device_name: "MY-PC".into(),
+                    info1: String::new(),
+                    info2: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Survives a reopen from disk, like every other field.
+        let reopened = Store::open(&dir.0).await.unwrap();
+        let rec = reopened.read_record(&rid).await.unwrap().unwrap();
+        assert_eq!(rec.m2_apex_ver, "2026.10.1");
+        assert_eq!(rec.cp_acc, "open_source");
+
+        // The serialized view keeps the requested field order: immediately
+        // after `updated_at`.
+        let line = rec.to_string();
+        let pos = |needle: &str| line.find(needle).expect("field must be serialized");
+        assert!(
+            pos("\"updated_at\"") < pos("\"m2_apex_ver\"")
+                && pos("\"m2_apex_ver\"") < pos("\"cp_acc\"")
+                && pos("\"cp_acc\"") < pos("\"ghname\""),
+            "m2_apex_ver/cp_acc must serialize right after updated_at: {line}"
+        );
+
+        // A record written before these keys existed has neither; reading it
+        // must yield empty strings rather than fail.
+        {
+            let mut inner = store.inner.lock().await;
+            let legacy = inner
+                .doc
+                .put_object(ROOT, "record:legacy", ObjType::Map)
+                .unwrap();
+            inner.doc.put(&legacy, "ghname", "old").unwrap();
+        }
+        let legacy = store.read_record("legacy").await.unwrap().unwrap();
+        assert_eq!(legacy.m2_apex_ver, "");
+        assert_eq!(legacy.cp_acc, "");
+    }
+
+    /// Emulate what a build from before `m2_apex_ver` / `cp_acc` existed
+    /// writes for one record: the eight original fields, and nothing else.
+    /// Note what it does *not* do — delete the keys it has never heard of.
+    fn old_build_write(doc: &mut AutoCommit, record_id: &str, tag: &str) {
+        let key = format!("{RECORD_PREFIX}{record_id}");
+        let rec = match doc.get(ROOT, &key).unwrap() {
+            Some((automerge::Value::Object(ObjType::Map), obj)) => obj,
+            _ => doc.put_object(ROOT, &key, ObjType::Map).unwrap(),
+        };
+        doc.put(&rec, "updated_at", "2026-01-01T00:00:00+00:00").unwrap();
+        doc.put(&rec, "ghname", format!("gh-{tag}")).unwrap();
+        doc.put(&rec, "loginname", format!("login-{tag}")).unwrap();
+        doc.put(&rec, "cp_aic", 1.0).unwrap();
+        doc.put(&rec, "device_id", "old-device").unwrap();
+        doc.put(&rec, "device_name", "OLD-PC").unwrap();
+        doc.put(&rec, "info1", "a").unwrap();
+        doc.put(&rec, "info2", "b").unwrap();
+    }
+
+    #[tokio::test]
+    async fn merges_with_data_written_by_an_older_build() {
+        // Mixed swarm: an old peer that knows nothing about the new keys
+        // keeps syncing with a new peer that writes them. Automerge merges
+        // at op level, so an unknown key is just data — it has to survive
+        // both a merge and an old peer's update.
+        let dir = TempDir::new("compat");
+        let store = Store::open(&dir.0).await.unwrap();
+        let rid = Uuid::new_v4().to_string();
+
+        // 1) The document starts out as an old build left it. Reading it with
+        // this build yields the original fields, plus empty new keys.
+        {
+            let mut inner = store.inner.lock().await;
+            old_build_write(&mut inner.doc, &rid, "v1");
+        }
+        store.persist_snapshot().await.unwrap();
+        let rec = store.read_record(&rid).await.unwrap().unwrap();
+        assert_eq!(rec.ghname, "gh-v1");
+        assert_eq!(rec.m2_apex_ver, "");
+        assert_eq!(rec.cp_acc, "");
+
+        // 2) This build's update fills the new keys in, exactly as the
+        // `update` subcommand does: read first, then write every field back.
+        store
+            .upsert_record(
+                &rid,
+                &RecordUpsert {
+                    m2_apex_ver: "2026.10.1".into(),
+                    cp_acc: "emu".into(),
+                    ghname: rec.ghname.clone(),
+                    loginname: rec.loginname.clone(),
+                    cp_aic: rec.cp_aic,
+                    device_id: rec.device_id.clone(),
+                    device_name: rec.device_name.clone(),
+                    info1: rec.info1.clone(),
+                    info2: rec.info2.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // 3) The old peer then updates the same record, writing only its own
+        // eight fields. Its write must land, and must not erase the keys it
+        // has never heard of.
+        {
+            let mut inner = store.inner.lock().await;
+            old_build_write(&mut inner.doc, &rid, "v2");
+        }
+        store.persist_snapshot().await.unwrap();
+        let rec = store.read_record(&rid).await.unwrap().unwrap();
+        assert_eq!(rec.ghname, "gh-v2", "the old peer's write must still land");
+        assert_eq!(rec.m2_apex_ver, "2026.10.1", "an old peer must not erase the new keys");
+        assert_eq!(rec.cp_acc, "emu");
+        assert_eq!(rec.info1, "a", "old fields must survive the round trip");
+
+        // 4) A genuinely concurrent merge: two peers fork the same history,
+        // one new and one old, then merge. The result is the union of their
+        // ops — the old side cannot drop the new keys, because a merge never
+        // consults a schema.
+        let mut base = AutoCommit::new();
+        old_build_write(&mut base, &rid, "base");
+        let mut peer_new = base.fork();
+        let mut peer_old = base.fork();
+        {
+            let key = format!("{RECORD_PREFIX}{rid}");
+            let (_, rec_new) = peer_new.get(ROOT, &key).unwrap().unwrap();
+            peer_new.put(&rec_new, "m2_apex_ver", "2026.11.0").unwrap();
+            peer_new.put(&rec_new, "cp_acc", "open_source").unwrap();
+        }
+        old_build_write(&mut peer_old, &rid, "concurrent-old");
+        peer_new.merge(&mut peer_old).unwrap();
+
+        let merged = Store::read_record_inner(&peer_new, &rid).unwrap().unwrap();
+        assert_eq!(merged.m2_apex_ver, "2026.11.0");
+        assert_eq!(merged.cp_acc, "open_source");
+        assert_eq!(merged.ghname, "gh-concurrent-old", "old-side writes merge in");
+        assert_eq!(merged.info2, "b", "old-side fields survive the merge");
+    }
+
+    #[tokio::test]
     async fn concurrent_persist_keeps_every_write() {
         // Regression guard for the temp-file collision: many concurrent sync
         // tasks each persist; no save may silently clobber another.
@@ -1718,6 +1911,8 @@ mod tests {
                 s.upsert_record(
                     &id,
                     &RecordUpsert {
+                        m2_apex_ver: "2026.10.1".into(),
+                        cp_acc: "open_source".into(),
                         ghname: format!("u{i}"),
                         loginname: "l".into(),
                         cp_aic: i as f64,
@@ -1771,6 +1966,8 @@ mod tests {
             .upsert_record(
                 &rid,
                 &RecordUpsert {
+                    m2_apex_ver: "2026.10.1".into(),
+                    cp_acc: "emu".into(),
                     ghname: "b".into(),
                     loginname: "b".into(),
                     cp_aic: 1.0,
